@@ -130,9 +130,19 @@ class ThesisAnalyzer:
         destination = f"{self.container_name}:{container_import_dir}/{self.csv_filename}"
         try:
             print(f"Ensuring {container_import_dir} directory exists in '{self.container_name}'...")
-            subprocess.run(['docker', 'exec', self.container_name, 'mkdir', '-p', container_import_dir], check=True, capture_output=True)
+            
+            exec_command = ['sudo', '-S', 'docker', 'exec', self.container_name, 'mkdir', '-p', container_import_dir]
+            cp_command = ['sudo', '-S', 'docker', 'cp', self.csv_filepath, destination]
+            
+
             print(f"Executing: docker cp {self.csv_filepath} {destination}")
-            subprocess.run(['docker', 'cp', self.csv_filepath, destination], check=True, capture_output=True)
+            subprocess.run(
+                cp_command,
+                input=('ubuntu' + '\n').encode(), # Encode the password and add a newline
+                check=True,
+                capture_output=True
+            )
+
             print("File copied successfully.")
             return True
         except subprocess.CalledProcessError as e:
