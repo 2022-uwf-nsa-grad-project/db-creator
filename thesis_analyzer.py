@@ -134,6 +134,12 @@ class ThesisAnalyzer:
             exec_command = ['sudo', '-S', 'docker', 'exec', self.container_name, 'mkdir', '-p', container_import_dir]
             cp_command = ['sudo', '-S', 'docker', 'cp', self.csv_filepath, destination]
             
+            subprocess.run(
+                exec_command,
+                input=('ubuntu' + '\n').encode(), # Encode the password and add a newline
+                check=True,
+                capture_output=True
+            )           
 
             print(f"Executing: docker cp {self.csv_filepath} {destination}")
             subprocess.run(
