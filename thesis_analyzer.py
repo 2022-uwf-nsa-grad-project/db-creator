@@ -115,7 +115,7 @@ class ThesisAnalyzer:
             
             print("\nCombining and cleaning data...")
             combined_df = pd.concat(all_dataframes, ignore_index=True)
-            cleaned_df = combined_df[combined_df['label_technique'] != 'Duplicate'].copy()
+            cleaned_df = combined_df[combined_df['label_technique'] != 'Duplicate'].copy().head(100_000)
             
             print(f"Prepared {len(cleaned_df):,} rows for import.")
             return cleaned_df
