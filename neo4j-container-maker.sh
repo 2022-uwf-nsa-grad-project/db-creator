@@ -6,7 +6,7 @@
 # --- CONFIGURATION ---
 CONTAINER_NAME="neo4j_thesis_server"
 NEO4J_USER="neo4j"
-NEO4J_IMAGE="neo4j:latest" 
+NEO4J_IMAGE="neo4j:latest"
 HOST_DATA_DIR="${PWD}/data"
 NEO4J_BOLT_PORT="7687"
 
@@ -17,7 +17,7 @@ echo "This script will use 'sudo' for Docker and system commands."
 while true; do
     echo -n "Enter the desired password for the '$NEO4J_USER' user (min 8 chars): "
     read -s NEO4J_PASSWORD
-    echo 
+    echo
 
     if [ ${#NEO4J_PASSWORD} -lt 8 ]; then
         echo "ERROR: Password must be at least 8 characters long. Please try again."
@@ -63,16 +63,17 @@ else
 fi
 
 # --- 4. RUN NEW CONTAINER ---
-sudo mkdir -p "$HOST_DATA_DIR"
 echo "Launching new Neo4j container: '$CONTAINER_NAME' with GDS Plugin..."
 
+# MODIFIED: Removed the volume mount to prevent permission errors on macOS.
 sudo docker run -d \
     --name "$CONTAINER_NAME" \
     -p "$HOST_HTTP_PORT":7474 \
     -p "$NEO4J_BOLT_PORT":7687 \
-    -v "$HOST_DATA_DIR":/var/lib/neo4j/data \
-    -e NEO4J_AUTH="$NEO4J_USER/$NEO4J_PASSWORD" \
+    -e NEO4J_AUTH="${NEO4J_USER}/${NEO4J_PASSWORD}" \
     -e NEO4J_PLUGINS='["graph-data-science"]' \
+    --env NEO4J_dbms_memory_heap_initial__size=2G \
+    --env NEO4J_dbms_memory_heap_max__size=4G \
     "$NEO4J_IMAGE"
 
 if [ $? -ne 0 ]; then
@@ -80,13 +81,34 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "Waiting 10 seconds for Neo4j to initialize..."
-sleep 10
+echo "Waiting 25 seconds for Neo4j to initialize..."
+sleep 25
 
-# --- 5. PYTHON CONNECTION TEST ---
+# --- 5. PYTHON DEPENDENCY INSTALLATION ---
+echo ""
+echo "--- Installing/Verifying Python Dependencies ---"
+sudo -E python -m pip install \
+    "fpdf>=1.7.2" \
+    "matplotlib>=3.10.6" \
+    "neo4j>=6.0.2" \
+    "pandas>=2.3.2" \
+    "networkx>=3.5" \
+    "numpy>=2.3.2" \
+    "pyarrow>=21.0.0" \
+    "scikit-learn>=1.7.2" \
+    "scipy>=1.16.2" \
+    "urllib3>=2.5.0"
+
+if [ $? -ne 0 ]; then
+    echo "FATAL ERROR: Failed to install Python dependencies. Aborting."
+    exit 1
+fi
+echo "Dependencies are up to date."
+
+# --- 6. PYTHON CONNECTION TEST ---
 echo ""
 echo "--- Running Python Bolt Connection Test ---"
-sudo python -c "
+sudo -E python -c "
 import os, sys
 from neo4j import GraphDatabase, exceptions
 try:
@@ -102,7 +124,7 @@ finally:
         driver.close()
 "
 
-# --- 6. FINAL CONFIRMATION ---
+# --- 7. FINAL CONFIRMATION ---
 echo ""
 echo "=========================================================="
 echo "Deployment Complete."
