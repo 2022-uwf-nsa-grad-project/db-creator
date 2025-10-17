@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import roc_curve, auc, confusion_matrix
 import time
 import warnings
 import json
@@ -94,29 +95,30 @@ class KillChainAnalyzer(Neo4jConnection):
     def run_full_analysis(self):
         """Run complete exploratory analysis."""
         try:
-            if self.connect():
-                print("\n" + "="*70)
-                print("KILL CHAIN EXPLORATORY ANALYSIS")
-                print("="*70)
-                
-                # Basic statistics
-                self.get_basic_stats()
-                
-                # Find pivot nodes (victim -> attacker transitions)
-                pivot_df = self.find_pivot_nodes()
-                
-                # Analyze pivot characteristics
-                if pivot_df is not None and len(pivot_df) > 0:
-                    self.analyze_pivot_timing(pivot_df)
-                    self.analyze_pivot_tactics(pivot_df)
-                    self.analyze_attack_chains(pivot_df)
-                    self.visualize_pivot_patterns(pivot_df)
-                else:
-                    print("\n⚠ No pivot nodes found in the data")
-                
-                print("\n" + "="*70)
-                print("ANALYSIS COMPLETE")
-                print("="*70)
+            self.connect()
+            
+            print("\n" + "="*70)
+            print("KILL CHAIN EXPLORATORY ANALYSIS")
+            print("="*70)
+            
+            # Basic statistics
+            self.get_basic_stats()
+            
+            # Find pivot nodes (victim -> attacker transitions)
+            pivot_df = self.find_pivot_nodes()
+            
+            # Analyze pivot characteristics
+            if pivot_df is not None and len(pivot_df) > 0:
+                self.analyze_pivot_timing(pivot_df)
+                self.analyze_pivot_tactics(pivot_df)
+                self.analyze_attack_chains(pivot_df)
+                self.visualize_pivot_patterns(pivot_df)
+            else:
+                print("\n⚠ No pivot nodes found in the data")
+            
+            print("\n" + "="*70)
+            print("ANALYSIS COMPLETE")
+            print("="*70)
             
         finally:
             self.close()
@@ -170,37 +172,66 @@ class KillChainAnalyzer(Neo4jConnection):
         print("\n--- FINDING PIVOT NODES (Victim → Attacker Transitions) ---")
         
         with self.driver.session(database=self.database) as session:
-            query = """
-            // Find nodes that received attacks
+            # First, find unique IPs that both received AND sent attacks
+            pivot_ips_query = """
             MATCH (attacker:IP)-[r1:CONNECTS]->(pivot:IP)
             WHERE r1.is_attack = 1
-            
-            // And later sent attacks
+            WITH DISTINCT pivot
             MATCH (pivot)-[r2:CONNECTS]->(victim:IP)
             WHERE r2.is_attack = 1
-            AND r2.timestamp > r1.timestamp  // Happened AFTER being attacked
-            AND pivot <> attacker  // Pivot is different from original attacker
-            AND victim <> attacker  // Not attacking back to original attacker
-            
-            RETURN DISTINCT
-                pivot.address as pivot_ip,
-                attacker.address as initial_attacker,
-                victim.address as subsequent_victim,
-                r1.timestamp as compromised_time,
-                r2.timestamp as attack_time,
-                (r2.timestamp - r1.timestamp) as time_to_attack,
-                r1.tactic as compromise_tactic,
-                r2.tactic as attack_tactic,
-                r1.port as compromise_port,
-                r2.port as attack_port
-            ORDER BY r1.timestamp
+            RETURN DISTINCT pivot.address as pivot_ip
             """
             
-            result = session.run(query)
+            pivot_ips_result = session.run(pivot_ips_query)
+            pivot_ips = [record['pivot_ip'] for record in pivot_ips_result]
+            
+            print(f"  ✓ Found {len(pivot_ips)} unique pivot IPs")
+            
+            if not pivot_ips:
+                print("  ⚠ No pivot nodes found")
+                return None
+            
+            # Now get detailed pivot instances (first time they were attacked → first time they attacked)
+            query = """
+            UNWIND $pivot_ips AS pivot_address
+            
+            // Get first time this IP was attacked
+            MATCH (attacker:IP)-[r1:CONNECTS]->(pivot:IP {address: pivot_address})
+            WHERE r1.is_attack = 1
+            WITH pivot, attacker, r1
+            ORDER BY r1.timestamp
+            WITH pivot, collect({attacker: attacker.address, time: r1.timestamp, tactic: r1.tactic, port: r1.port})[0] AS first_compromise
+            
+            // Get first time this IP attacked after being compromised
+            MATCH (pivot)-[r2:CONNECTS]->(victim:IP)
+            WHERE r2.is_attack = 1 
+              AND r2.timestamp > first_compromise.time
+              AND victim.address <> first_compromise.attacker  // Not attacking back
+            WITH pivot, first_compromise, victim, r2
+            ORDER BY r2.timestamp
+            WITH pivot, first_compromise, collect({victim: victim.address, time: r2.timestamp, tactic: r2.tactic, port: r2.port})[0] AS first_pivot_attack
+            
+            WHERE first_pivot_attack IS NOT NULL
+            
+            RETURN 
+                pivot.address as pivot_ip,
+                first_compromise.attacker as initial_attacker,
+                first_pivot_attack.victim as subsequent_victim,
+                first_compromise.time as compromised_time,
+                first_pivot_attack.time as attack_time,
+                (first_pivot_attack.time - first_compromise.time) as time_to_attack,
+                first_compromise.tactic as compromise_tactic,
+                first_pivot_attack.tactic as attack_tactic,
+                first_compromise.port as compromise_port,
+                first_pivot_attack.port as attack_port
+            ORDER BY compromised_time
+            """
+            
+            result = session.run(query, pivot_ips=pivot_ips)
             records = [dict(record) for record in result]
             
             if not records:
-                print("  ⚠ No pivot nodes found")
+                print("  ⚠ No valid pivot transitions found")
                 return None
             
             df = pd.DataFrame(records)
@@ -208,8 +239,28 @@ class KillChainAnalyzer(Neo4jConnection):
             # Convert time_to_attack to hours
             df['hours_to_attack'] = df['time_to_attack'] / 3600
             
-            print(f"  ✓ Found {len(df):,} pivot instances")
-            print(f"  ✓ Unique pivot IPs: {df['pivot_ip'].nunique():,}")
+            print(f"  ✓ Found {len(df):,} unique pivot transitions (first compromise → first attack)")
+            
+            # Also get total activity stats per pivot
+            activity_query = """
+            UNWIND $pivot_ips AS pivot_address
+            MATCH (a:IP)-[r1:CONNECTS]->(pivot:IP {address: pivot_address})
+            WHERE r1.is_attack = 1
+            WITH pivot, count(r1) as times_attacked
+            MATCH (pivot)-[r2:CONNECTS]->(v:IP)
+            WHERE r2.is_attack = 1
+            WITH pivot.address as ip, times_attacked, count(r2) as times_attacked_others
+            RETURN ip, times_attacked, times_attacked_others
+            ORDER BY times_attacked_others DESC
+            """
+            
+            activity_result = session.run(activity_query, pivot_ips=pivot_ips)
+            activity_df = pd.DataFrame([dict(r) for r in activity_result])
+            
+            print(f"\n  Pivot Activity Summary:")
+            print(f"    Most active pivot: {activity_df.iloc[0]['ip']}")
+            print(f"      Times compromised: {activity_df.iloc[0]['times_attacked']:,}")
+            print(f"      Subsequent attacks launched: {activity_df.iloc[0]['times_attacked_others']:,}")
             
             return df
     
@@ -342,8 +393,6 @@ class KillChainAnalyzer(Neo4jConnection):
         print("  ✓ Saved pivot node data to 'pivot_nodes.csv'")
 
 
-
-
 class ThesisAnalyzer(Neo4jConnection):
     """
     A comprehensive class to manage the entire data pipeline for the thesis project.
@@ -409,7 +458,7 @@ class ThesisAnalyzer(Neo4jConnection):
             
             print("\nCombining and cleaning data...")
             combined_df = pd.concat(all_dataframes, ignore_index=True)
-            cleaned_df = combined_df[combined_df['label_technique'] != 'Duplicate'].copy().head(100_000)
+            cleaned_df = combined_df[combined_df['label_technique'] != 'Duplicate'].copy().head(500_000)
             
             print(f"Prepared {len(cleaned_df):,} rows for import.")
             return cleaned_df
@@ -521,29 +570,44 @@ class ThesisAnalyzer(Neo4jConnection):
         try:
             self.connect()
             if self.driver:
-                self.test_thesis_hypothesis()
+                self.test_pivot_prediction()
                 self.run_verification_query()
                 self.visualize_attack_graph()
         finally:
             self.close()
 
-    def test_thesis_hypothesis(self):
-        """Runs the GDS analysis to test the core hypothesis."""
-        print("\n--- Running Thesis Hypothesis Test ---")
+    def test_pivot_prediction(self):
+        """
+        Tests the core hypothesis: Can GNN embeddings predict which reconnaissance 
+        victims will become pivots?
+        """
+        print("\n" + "="*80)
+        print("PIVOT PREDICTION ANALYSIS")
+        print("="*80)
+        
         with self.driver.session(database=self.database) as session:
+            # Drop existing graph projection if it exists
             try: 
-                session.run("CALL gds.graph.drop('thesisGraph', false)")
+                session.run("CALL gds.graph.drop('pivotGraph', false)")
             except Exception: 
                 pass
             
-            print("1. Projecting graph into GDS...")
-            session.run("CALL gds.graph.project('thesisGraph', 'IP', {CONNECTS: {properties: 'is_attack'}})")
+            print("\n1. Projecting graph into GDS...")
+            session.run("""
+                CALL gds.graph.project(
+                    'pivotGraph', 
+                    'IP', 
+                    {CONNECTS: {properties: 'is_attack'}}
+                )
+            """)
+            print("   ✓ Graph projected")
             
-            print("2. Generating node embeddings with FastRP and writing back to nodes...")
+            print("\n2. Generating node embeddings with FastRP...")
             result = session.run("""
-                CALL gds.fastRP.write('thesisGraph', {
+                CALL gds.fastRP.write('pivotGraph', {
                     embeddingDimension: 128, 
-                    writeProperty: 'embedding'
+                    writeProperty: 'embedding',
+                    randomSeed: 42
                 })
                 YIELD nodePropertiesWritten
                 RETURN nodePropertiesWritten
@@ -551,49 +615,179 @@ class ThesisAnalyzer(Neo4jConnection):
             nodes_updated = result.single()['nodePropertiesWritten']
             print(f"   ✓ Created embeddings for {nodes_updated:,} nodes")
             
-            print("3. Fetching embeddings for correlation analysis...")
-            early_stage_tactics = ['Reconnaissance', 'Initial Access']
+            print("\n3. Identifying reconnaissance victims and their outcomes...")
             
-            # Get early-stage attacker embedding
-            early_query = """
-            MATCH (a:IP)-[r:CONNECTS]->() 
-            WHERE r.tactic IN $tactics AND a.embedding IS NOT NULL
-            RETURN a.embedding AS embedding 
-            LIMIT 1
-            """
-            early_result = session.run(early_query, tactics=early_stage_tactics).single()
-            
-            # Get late-stage attacker embedding  
-            late_query = """
-            MATCH (a:IP)-[r:CONNECTS]->() 
+            # Get all IPs that received reconnaissance attacks
+            victims_query = """
+            MATCH (attacker:IP)-[r:CONNECTS]->(victim:IP)
             WHERE r.is_attack = 1 
-            AND NOT r.tactic IN $early_tactics 
-            AND r.tactic <> 'none' 
-            AND r.tactic <> 'Duplicate'
-            AND a.embedding IS NOT NULL
-            RETURN a.embedding AS embedding 
-            LIMIT 1
+              AND r.tactic = 'Reconnaissance'
+              AND victim.embedding IS NOT NULL
+            WITH DISTINCT victim
+            
+            // Check if this victim later became an attacker
+            OPTIONAL MATCH (victim)-[r2:CONNECTS]->(target:IP)
+            WHERE r2.is_attack = 1
+            
+            RETURN 
+                victim.address AS ip,
+                victim.embedding AS embedding,
+                count(r2) > 0 AS became_pivot
             """
-            late_result = session.run(late_query, early_tactics=early_stage_tactics).single()
             
-            if not early_result or not late_result:
-                print("Could not find embeddings for both early and late-stage attacks.")
+            result = session.run(victims_query)
+            victims = [dict(record) for record in result]
+            
+            if not victims:
+                print("   ✗ No reconnaissance victims found with embeddings")
                 return
-
-            early_embedding = np.array(early_result['embedding']).reshape(1, -1)
-            late_embedding = np.array(late_result['embedding']).reshape(1, -1)
-            similarity_score = cosine_similarity(early_embedding, late_embedding)[0][0]
             
-            print("\n--- HYPOTHESIS TEST RESULTS ---")
-            print(f"Cosine Similarity between an Early and a Late-Stage Attacker Node: {similarity_score:.4f}")
-            if similarity_score > 0.85:
-                print("Result: High correlation found. The hypothesis is strongly supported.")
+            victims_df = pd.DataFrame(victims)
+            
+            pivot_count = victims_df['became_pivot'].sum()
+            non_pivot_count = len(victims_df) - pivot_count
+            
+            print(f"   ✓ Found {len(victims_df)} reconnaissance victims:")
+            print(f"      - Became pivots: {pivot_count} ({pivot_count/len(victims_df)*100:.1f}%)")
+            print(f"      - Did NOT pivot: {non_pivot_count} ({non_pivot_count/len(victims_df)*100:.1f}%)")
+            
+            if pivot_count == 0:
+                print("   ✗ No pivots found - cannot test hypothesis")
+                return
+            
+            print("\n4. Computing embedding similarities...")
+            
+            # Separate pivots and non-pivots
+            pivot_embeddings = np.array([v['embedding'] for v in victims if v['became_pivot']])
+            non_pivot_embeddings = np.array([v['embedding'] for v in victims if not v['became_pivot']])
+            
+            # Compute reference pivot embedding (mean of all pivots)
+            reference_pivot_embedding = np.mean(pivot_embeddings, axis=0)
+            
+            # Compute similarities for all victims
+            similarities = []
+            for victim in victims:
+                victim_emb = np.array(victim['embedding']).reshape(1, -1)
+                ref_emb = reference_pivot_embedding.reshape(1, -1)
+                sim = cosine_similarity(victim_emb, ref_emb)[0][0]
+                similarities.append({
+                    'ip': victim['ip'],
+                    'similarity': sim,
+                    'actual_pivot': victim['became_pivot']
+                })
+            
+            similarity_df = pd.DataFrame(similarities)
+            
+            # Statistical analysis
+            pivot_sims = similarity_df[similarity_df['actual_pivot']]['similarity']
+            non_pivot_sims = similarity_df[~similarity_df['actual_pivot']]['similarity']
+            
+            print(f"\n   Similarity Statistics:")
+            print(f"      Pivots:     mean={pivot_sims.mean():.4f}, median={pivot_sims.median():.4f}, std={pivot_sims.std():.4f}")
+            print(f"      Non-pivots: mean={non_pivot_sims.mean():.4f}, median={non_pivot_sims.median():.4f}, std={non_pivot_sims.std():.4f}")
+            print(f"      Difference: {pivot_sims.mean() - non_pivot_sims.mean():.4f}")
+            
+            # Statistical test
+            from scipy import stats
+            t_stat, p_value = stats.ttest_ind(pivot_sims, non_pivot_sims)
+            print(f"\n   Welch's t-test: t={t_stat:.4f}, p={p_value:.6f}")
+            
+            if p_value < 0.05:
+                print(f"   ✓ STATISTICALLY SIGNIFICANT (p < 0.05)")
             else:
-                print("Result: Low correlation found. The hypothesis is not supported.")
+                print(f"   ✗ Not statistically significant (p >= 0.05)")
+            
+            # Find optimal threshold using ROC curve
+            print("\n5. Finding optimal classification threshold...")
+            
+            fpr, tpr, thresholds = roc_curve(
+                similarity_df['actual_pivot'], 
+                similarity_df['similarity']
+            )
+            roc_auc = auc(fpr, tpr)
+            
+            # Find threshold that maximizes F1 score
+            f1_scores = []
+            for threshold in thresholds:
+                predictions = similarity_df['similarity'] >= threshold
+                tp = ((predictions) & (similarity_df['actual_pivot'])).sum()
+                fp = ((predictions) & (~similarity_df['actual_pivot'])).sum()
+                fn = ((~predictions) & (similarity_df['actual_pivot'])).sum()
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                f1_scores.append(f1)
+            
+            optimal_idx = np.argmax(f1_scores)
+            optimal_threshold = thresholds[optimal_idx]
+            
+            print(f"   ✓ Optimal threshold: {optimal_threshold:.4f}")
+            print(f"   ✓ AUC-ROC: {roc_auc:.4f}")
+            
+            # Make predictions with optimal threshold
+            print("\n6. Evaluating predictions with optimal threshold...")
+            
+            similarity_df['predicted_pivot'] = similarity_df['similarity'] >= optimal_threshold
+            
+            # Confusion matrix
+            cm = confusion_matrix(
+                similarity_df['actual_pivot'], 
+                similarity_df['predicted_pivot']
+            )
+            
+            tn, fp, fn, tp = cm.ravel()
+            
+            accuracy = (tp + tn) / len(similarity_df)
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            print("\n" + "="*80)
+            print("HYPOTHESIS TEST RESULTS")
+            print("="*80)
+            print(f"\nConfusion Matrix:")
+            print(f"                    Predicted Non-Pivot    Predicted Pivot")
+            print(f"Actual Non-Pivot           {tn:5d}                {fp:5d}")
+            print(f"Actual Pivot               {fn:5d}                {tp:5d}")
+            
+            print(f"\nPerformance Metrics:")
+            print(f"  Accuracy:  {accuracy*100:.2f}%")
+            print(f"  Precision: {precision*100:.2f}%")
+            print(f"  Recall:    {recall*100:.2f}%")
+            print(f"  F1-Score:  {f1:.4f}")
+            print(f"  AUC-ROC:   {roc_auc:.4f}")
+            
+            print(f"\n" + "="*80)
+            if accuracy >= 0.80:
+                print("✓ HYPOTHESIS SUPPORTED: Accuracy ≥ 80%")
+                print("  Graph structural embeddings successfully predict pivot behavior")
+            else:
+                print("✗ HYPOTHESIS NOT SUPPORTED: Accuracy < 80%")
+                print("  Structural features alone may be insufficient")
+            print("="*80)
+            
+            # Save results
+            similarity_df.to_csv('pivot_predictions.csv', index=False)
+            print(f"\n✓ Detailed predictions saved to 'pivot_predictions.csv'")
+            
+            # Plot ROC curve
+            plt.figure(figsize=(10, 8))
+            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random guess')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title('ROC Curve: Pivot Prediction Using GNN Embeddings')
+            plt.legend(loc="lower right")
+            plt.grid(alpha=0.3)
+            plt.savefig('roc_curve.png', dpi=150, bbox_inches='tight')
+            print(f"✓ ROC curve saved to 'roc_curve.png'")
 
     def run_verification_query(self):
         """Finds and prints example attack paths from the graph."""
-        print("\n--- Verifying Attack Paths ---")
+        print("\n--- VERIFYING ATTACK PATHS ---")
         query = """
         MATCH (a:IP)-[r:CONNECTS]->(v:IP) 
         WHERE r.is_attack = 1 AND r.tactic <> 'none' AND r.tactic <> 'Duplicate' 
@@ -611,8 +805,8 @@ class ThesisAnalyzer(Neo4jConnection):
 
     def visualize_attack_graph(self):
         """Generates and saves a PNG visualization of the attack graph."""
-        print("\n--- Generating Graph Visualization ---")
-        query = "MATCH (a:IP)-[r:CONNECTS]->(v:IP) RETURN a.address AS source, v.address AS target, r.is_attack AS is_attack"
+        print("\n--- GENERATING GRAPH VISUALIZATION ---")
+        query = "MATCH (a:IP)-[r:CONNECTS]->(v:IP) RETURN a.address AS source, v.address AS target, r.is_attack AS is_attack LIMIT 1000"
         
         with self.driver.session(database=self.database) as session:
             results = session.run(query).data()
@@ -638,6 +832,6 @@ class ThesisAnalyzer(Neo4jConnection):
         pos = nx.spring_layout(G, k=0.7, iterations=40)
         nx.draw(G, pos, with_labels=True, node_color=node_colors, edge_color=edge_colors, 
                 node_size=1500, font_size=8, width=0.8, arrows=True)
-        plt.title("Real Zeek Data Network Graph with Attack Paths Highlighted", size=20)
-        plt.savefig("real_attack_graph.png")
-        print("Visualization saved to real_attack_graph.png")
+        plt.title("Network Graph with Attack Paths Highlighted (Red=Attackers)", size=20)
+        plt.savefig("network_attack_graph.png", dpi=150, bbox_inches='tight')
+        print("✓ Visualization saved to 'network_attack_graph.png'")

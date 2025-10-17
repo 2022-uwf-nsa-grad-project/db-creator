@@ -10,6 +10,7 @@ A comprehensive toolkit for building and analyzing network graphs for threat int
 from .base import Neo4jConnection
 from .analyzers import ThesisAnalyzer, KillChainAnalyzer, StructuralPivotAnalyzer
 from .reporting import ReportGenerator
+from .controller import AnalysisController
 
 # The __all__ variable explicitly defines the public API of the package.
 # It specifies which names are imported when a user does `from CART import *`.
@@ -18,5 +19,6 @@ __all__ = [
     'ThesisAnalyzer',
     'KillChainAnalyzer',
     'StructuralPivotAnalyzer',
-    'ReportGenerator'
+    'ReportGenerator',
+    'AnalysisController'
 ]

@@ -17,6 +17,10 @@ class AnalysisController:
         self.password = password
         self.database = database
         print("✅ Analysis Controller is configured and ready.")
+        self.ThesisAnalyzer = self.create_thesis_analyzer()
+        self.KillChainAnalyzer = self.create_kill_chain_analyzer()
+        self.StructuralPivotAnalyzer = self.create_structural_analyzer()
+
 
     def create_thesis_analyzer(self):
         """Creates a pre-configured instance of ThesisAnalyzer."""
@@ -30,6 +34,8 @@ class AnalysisController:
         """Creates a pre-configured instance of StructuralPivotAnalyzer."""
         return StructuralPivotAnalyzer(self.uri, self.user, self.password, self.database)
     
-    def create_report_generator(self, filepath):
+    @staticmethod
+    def create_report_generator(filepath):
         """Creates a pre-configured instance of ReportGenerator."""
         return ReportGenerator(filepath)
+
