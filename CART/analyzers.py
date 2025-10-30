@@ -1,837 +1,1630 @@
 from .base import Neo4jConnection
+from typing import Optional, Dict, List, Tuple
 import pandas as pd
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+import seaborn as sns
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import roc_curve, auc, confusion_matrix
+from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_curve
 import time
 import warnings
 import json
+from tqdm import tqdm
+from scipy import stats
+from collections import defaultdict
+import ipaddress
 
 warnings.filterwarnings('ignore')
 
-class StructuralPivotAnalyzer(Neo4jConnection):
-    """
-    Identifies potential pivots based on graph structure.
-    Inherits connection logic from Neo4jConnection.
-    """
-    
-    def __init__(self, uri, user, password, database="neo4j"):
-        # This one line calls the parent's __init__ method
-        # and sets up all the connection attributes for you.
-        super().__init__(uri, user, password, database)
-    
-    # You no longer need to define __init__, connect(), or close() here!
-    # They are all inherited from the parent class.
 
-    def run_analysis(self, output_filepath="structural_pivots.json"):
-        """
-        Runs the full analysis pipeline.
-        """
+class TemporalWindowAnalyzer(Neo4jConnection):
+    """
+    Analyzes optimal temporal windows for pivot behavior detection.
+    Determines appropriate historical observation periods and pivot detection windows.
+    """
+    
+    def __init__(self, connection: Optional[Neo4jConnection] = None,
+                 uri="bolt://localhost:7687", user="neo4j", password=None,
+                 database="neo4j", container_name="neo4j_temporal_analyzer", **kwargs):
+        if connection is not None:
+            self._shared_connection = connection
+            self.driver = connection.driver
+            self.uri = connection.uri
+            self.user = connection.user
+            self.password = connection.password
+            self.database = connection.database
+            self.container_name = connection.container_name
+            self._owns_driver = False
+        else:
+            super().__init__(uri=uri, user=user, password=password,
+                             database=database, container_name=container_name, **kwargs)
+            self._shared_connection = None
+            self._owns_driver = True
+
+    def start(self, password: Optional[str] = None):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.start(password)
+        return super().start(password)
+
+    def stop(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.stop()
+        return super().stop()
+
+    def remove(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.remove()
+        return super().remove()
+
+    def restart(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.restart()
+        return super().restart()
+
+    def connect(self):
+        if getattr(self, "_shared_connection", None):
+            ok = self._shared_connection.connect()
+            self.driver = self._shared_connection.driver
+            return ok
+        return super().connect()
+
+    def close(self):
+        if getattr(self, "_shared_connection", None):
+            print("Shared connection managed by controller; not closing driver here.")
+            return
+        return super().close()
+    
+    def run_analysis(self, output_filepath="temporal_window_analysis.json"):
+        """Runs comprehensive temporal window analysis."""
         try:
-            if self.connect():
-                print("\n" + "="*70)
-                print("STRUCTURAL PIVOT CANDIDATE ANALYSIS")
-                print("="*70)
-                
-                candidates = self.find_structural_pivots()
-                
-                if candidates:
-                    self.save_results_to_json(candidates, output_filepath)
-                else:
-                    print("⚠ No structural pivot candidates were found.")
-
+            if not self.connect():
+                print("Could not connect to Neo4j; aborting temporal analysis.")
+                return
+            
+            print("\n" + "="*80)
+            print("TEMPORAL WINDOW ANALYSIS FOR PIVOT DETECTION")
+            print("="*80)
+            
+            # Analyze pivot timing distributions
+            pivot_timings = self.analyze_pivot_timing_distribution()
+            
+            # Test different historical windows
+            window_results = self.test_historical_windows([3600, 12*3600, 24*3600, 48*3600])
+            
+            # Test different pivot detection windows
+            detection_results = self.test_pivot_detection_windows([3600, 6*3600, 12*3600, 24*3600, 48*3600])
+            
+            # Generate recommendations
+            recommendations = self.generate_recommendations(pivot_timings, window_results, detection_results)
+            
+            # Save results
+            results = {
+                'pivot_timings': pivot_timings,
+                'historical_window_tests': window_results,
+                'detection_window_tests': detection_results,
+                'recommendations': recommendations
+            }
+            
+            with open(output_filepath, 'w') as f:
+                json.dump(results, f, indent=4)
+            
+            print(f"\n✓ Results saved to {output_filepath}")
+            self.visualize_temporal_analysis(results)
+            
         finally:
-            # self.close() is also inherited
             self.close()
-
-    def find_structural_pivots(self):
-        """
-        Finds nodes that receive a connection and then initiate another one.
-        """
-        print("--- Finding all A -> B -> C structural and temporal paths ---")
-        start_time = time.time()
+    
+    def analyze_pivot_timing_distribution(self):
+        """Analyze the time distribution between reconnaissance and pivot attacks."""
+        print("\n--- Analyzing Pivot Timing Distribution ---")
         
         with self.driver.session(database=self.database) as session:
             query = """
             MATCH (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)
-            WHERE r2.timestamp > r1.timestamp AND a <> c AND b <> a
-            RETURN
-                a.address AS source_ip, b.address AS pivot_ip, c.address AS final_victim_ip,
-                r1.timestamp AS compromise_time, r1.tactic AS compromise_tactic,
-                r1.port AS compromise_port, r1.is_attack AS compromise_is_attack,
-                r2.timestamp AS pivot_time, r2.tactic AS pivot_tactic,
-                r2.port AS pivot_port, r2.is_attack AS pivot_is_attack,
-                (r2.timestamp - r1.timestamp) AS time_to_pivot
-            LIMIT 500000
-            """
-            result = session.run(query)
-            records = [dict(record) for record in result]
-            elapsed = time.time() - start_time
-            print(f"✓ Found {len(records):,} candidates in {elapsed:.2f} seconds.")
-            return records
-            
-    def save_results_to_json(self, candidates, filepath):
-        """Saves the list of candidate dictionaries to a JSON file."""
-        print(f"--- Saving {len(candidates):,} candidates to {filepath} ---")
-        with open(filepath, 'w') as f:
-            json.dump(candidates, f, indent=4)
-        print(f"✓ Data successfully written.")
-
-class KillChainAnalyzer(Neo4jConnection):
-    """
-    Exploratory analysis of APT kill chain patterns in network data.
-    Inherits connection logic from Neo4jConnection.
-    """
-    
-    def __init__(self, uri, user, password, database="neo4j"):
-        # This one line handles everything
-        super().__init__(uri, user, password, database)
-    
-    def run_full_analysis(self):
-        """Run complete exploratory analysis."""
-        try:
-            self.connect()
-            
-            print("\n" + "="*70)
-            print("KILL CHAIN EXPLORATORY ANALYSIS")
-            print("="*70)
-            
-            # Basic statistics
-            self.get_basic_stats()
-            
-            # Find pivot nodes (victim -> attacker transitions)
-            pivot_df = self.find_pivot_nodes()
-            
-            # Analyze pivot characteristics
-            if pivot_df is not None and len(pivot_df) > 0:
-                self.analyze_pivot_timing(pivot_df)
-                self.analyze_pivot_tactics(pivot_df)
-                self.analyze_attack_chains(pivot_df)
-                self.visualize_pivot_patterns(pivot_df)
-            else:
-                print("\n⚠ No pivot nodes found in the data")
-            
-            print("\n" + "="*70)
-            print("ANALYSIS COMPLETE")
-            print("="*70)
-            
-        finally:
-            self.close()
-    
-    def get_basic_stats(self):
-        """Get basic statistics about the network and attacks."""
-        print("\n--- BASIC STATISTICS ---")
-        
-        with self.driver.session(database=self.database) as session:
-            # Total nodes and edges
-            result = session.run("MATCH (n:IP) RETURN count(n) as node_count")
-            node_count = result.single()["node_count"]
-            
-            result = session.run("MATCH ()-[r:CONNECTS]->() RETURN count(r) as edge_count")
-            edge_count = result.single()["edge_count"]
-            
-            # Attack statistics
-            result = session.run("MATCH ()-[r:CONNECTS]->() WHERE r.is_attack = 1 RETURN count(r) as attack_count")
-            attack_count = result.single()["attack_count"]
-            
-            # Unique attackers and victims
-            result = session.run("""
-                MATCH (a:IP)-[r:CONNECTS]->(v:IP) 
-                WHERE r.is_attack = 1 
-                RETURN count(DISTINCT a) as attacker_count, count(DISTINCT v) as victim_count
-            """)
-            row = result.single()
-            attacker_count = row["attacker_count"]
-            victim_count = row["victim_count"]
-            
-            print(f"  Total IPs: {node_count:,}")
-            print(f"  Total Connections: {edge_count:,}")
-            print(f"  Attack Connections: {attack_count:,} ({attack_count/edge_count*100:.1f}%)")
-            print(f"  Unique Attackers: {attacker_count:,}")
-            print(f"  Unique Victims: {victim_count:,}")
-            
-            # Tactic distribution
-            result = session.run("""
-                MATCH ()-[r:CONNECTS]->() 
-                WHERE r.is_attack = 1 AND r.tactic <> 'none'
-                RETURN r.tactic as tactic, count(*) as count 
-                ORDER BY count DESC
-            """)
-            
-            print("\n  Attack Tactics Distribution:")
-            for record in result:
-                print(f"    {record['tactic']}: {record['count']:,}")
-    
-    def find_pivot_nodes(self):
-        """Find nodes that were victims and later became attackers (lateral movement pivots)."""
-        print("\n--- FINDING PIVOT NODES (Victim → Attacker Transitions) ---")
-        
-        with self.driver.session(database=self.database) as session:
-            # First, find unique IPs that both received AND sent attacks
-            pivot_ips_query = """
-            MATCH (attacker:IP)-[r1:CONNECTS]->(pivot:IP)
-            WHERE r1.is_attack = 1
-            WITH DISTINCT pivot
-            MATCH (pivot)-[r2:CONNECTS]->(victim:IP)
-            WHERE r2.is_attack = 1
-            RETURN DISTINCT pivot.address as pivot_ip
-            """
-            
-            pivot_ips_result = session.run(pivot_ips_query)
-            pivot_ips = [record['pivot_ip'] for record in pivot_ips_result]
-            
-            print(f"  ✓ Found {len(pivot_ips)} unique pivot IPs")
-            
-            if not pivot_ips:
-                print("  ⚠ No pivot nodes found")
-                return None
-            
-            # Now get detailed pivot instances (first time they were attacked → first time they attacked)
-            query = """
-            UNWIND $pivot_ips AS pivot_address
-            
-            // Get first time this IP was attacked
-            MATCH (attacker:IP)-[r1:CONNECTS]->(pivot:IP {address: pivot_address})
-            WHERE r1.is_attack = 1
-            WITH pivot, attacker, r1
-            ORDER BY r1.timestamp
-            WITH pivot, collect({attacker: attacker.address, time: r1.timestamp, tactic: r1.tactic, port: r1.port})[0] AS first_compromise
-            
-            // Get first time this IP attacked after being compromised
-            MATCH (pivot)-[r2:CONNECTS]->(victim:IP)
-            WHERE r2.is_attack = 1 
-              AND r2.timestamp > first_compromise.time
-              AND victim.address <> first_compromise.attacker  // Not attacking back
-            WITH pivot, first_compromise, victim, r2
-            ORDER BY r2.timestamp
-            WITH pivot, first_compromise, collect({victim: victim.address, time: r2.timestamp, tactic: r2.tactic, port: r2.port})[0] AS first_pivot_attack
-            
-            WHERE first_pivot_attack IS NOT NULL
-            
+            WHERE r1.is_attack = 1 AND r1.tactic = 'Reconnaissance'
+              AND r2.is_attack = 1 AND r2.timestamp > r1.timestamp
+              AND a <> c
+            WITH (r2.timestamp - r1.timestamp) as time_diff
+            WHERE time_diff > 0 AND time_diff < 7*24*3600  // Within 1 week
             RETURN 
-                pivot.address as pivot_ip,
-                first_compromise.attacker as initial_attacker,
-                first_pivot_attack.victim as subsequent_victim,
-                first_compromise.time as compromised_time,
-                first_pivot_attack.time as attack_time,
-                (first_pivot_attack.time - first_compromise.time) as time_to_attack,
-                first_compromise.tactic as compromise_tactic,
-                first_pivot_attack.tactic as attack_tactic,
-                first_compromise.port as compromise_port,
-                first_pivot_attack.port as attack_port
-            ORDER BY compromised_time
+                time_diff / 3600 as hours_to_pivot,
+                count(*) as frequency
+            ORDER BY hours_to_pivot
             """
             
-            result = session.run(query, pivot_ips=pivot_ips)
-            records = [dict(record) for record in result]
+            result = session.run(query).data()
             
-            if not records:
-                print("  ⚠ No valid pivot transitions found")
-                return None
+            if not result:
+                print("  ⚠ No pivot timing data found")
+                return {}
             
-            df = pd.DataFrame(records)
+            df = pd.DataFrame(result)
             
-            # Convert time_to_attack to hours
-            df['hours_to_attack'] = df['time_to_attack'] / 3600
+            percentiles = [10, 25, 50, 75, 90, 95, 99]
+            stats_dict = {
+                'mean_hours': float(df['hours_to_pivot'].mean()),
+                'median_hours': float(df['hours_to_pivot'].median()),
+                'std_hours': float(df['hours_to_pivot'].std()),
+                'percentiles': {f'p{p}': float(np.percentile(df['hours_to_pivot'], p)) for p in percentiles},
+                'total_pivots': int(df['frequency'].sum())
+            }
             
-            print(f"  ✓ Found {len(df):,} unique pivot transitions (first compromise → first attack)")
+            print(f"\n  Pivot Timing Statistics:")
+            print(f"    Total pivots analyzed: {stats_dict['total_pivots']:,}")
+            print(f"    Mean time to pivot: {stats_dict['mean_hours']:.2f} hours")
+            print(f"    Median time to pivot: {stats_dict['median_hours']:.2f} hours")
+            print(f"\n  Percentiles:")
+            for p, val in stats_dict['percentiles'].items():
+                print(f"    {p}: {val:.2f} hours")
             
-            # Also get total activity stats per pivot
-            activity_query = """
-            UNWIND $pivot_ips AS pivot_address
-            MATCH (a:IP)-[r1:CONNECTS]->(pivot:IP {address: pivot_address})
-            WHERE r1.is_attack = 1
-            WITH pivot, count(r1) as times_attacked
-            MATCH (pivot)-[r2:CONNECTS]->(v:IP)
-            WHERE r2.is_attack = 1
-            WITH pivot.address as ip, times_attacked, count(r2) as times_attacked_others
-            RETURN ip, times_attacked, times_attacked_others
-            ORDER BY times_attacked_others DESC
-            """
-            
-            activity_result = session.run(activity_query, pivot_ips=pivot_ips)
-            activity_df = pd.DataFrame([dict(r) for r in activity_result])
-            
-            print(f"\n  Pivot Activity Summary:")
-            print(f"    Most active pivot: {activity_df.iloc[0]['ip']}")
-            print(f"      Times compromised: {activity_df.iloc[0]['times_attacked']:,}")
-            print(f"      Subsequent attacks launched: {activity_df.iloc[0]['times_attacked_others']:,}")
-            
-            return df
+            return stats_dict
     
-    def analyze_pivot_timing(self, pivot_df):
-        """Analyze timing between compromise and subsequent attack."""
-        print("\n--- PIVOT TIMING ANALYSIS ---")
+    def test_historical_windows(self, window_sizes: List[int]):
+        """Test different historical window sizes for feature extraction."""
+        print("\n--- Testing Historical Window Sizes ---")
         
-        print(f"  Time Between Compromise and Attack:")
-        print(f"    Mean: {pivot_df['hours_to_attack'].mean():.2f} hours")
-        print(f"    Median: {pivot_df['hours_to_attack'].median():.2f} hours")
-        print(f"    Min: {pivot_df['hours_to_attack'].min():.2f} hours")
-        print(f"    Max: {pivot_df['hours_to_attack'].max():.2f} hours")
-        
-        # How many within 24 hours?
-        within_24h = (pivot_df['hours_to_attack'] <= 24).sum()
-        within_48h = (pivot_df['hours_to_attack'] <= 48).sum()
-        within_1w = (pivot_df['hours_to_attack'] <= 168).sum()
-        
-        total = len(pivot_df)
-        print(f"\n  Pivot Attack Timeline:")
-        print(f"    Within 24 hours: {within_24h:,} ({within_24h/total*100:.1f}%)")
-        print(f"    Within 48 hours: {within_48h:,} ({within_48h/total*100:.1f}%)")
-        print(f"    Within 1 week: {within_1w:,} ({within_1w/total*100:.1f}%)")
-    
-    def analyze_pivot_tactics(self, pivot_df):
-        """Analyze what tactics are used for compromise vs subsequent attacks."""
-        print("\n--- PIVOT TACTIC ANALYSIS ---")
-        
-        print("  Most Common Compromise Tactics:")
-        compromise_tactics = pivot_df['compromise_tactic'].value_counts().head(10)
-        for tactic, count in compromise_tactics.items():
-            print(f"    {tactic}: {count:,}")
-        
-        print("\n  Most Common Attack Tactics (After Compromise):")
-        attack_tactics = pivot_df['attack_tactic'].value_counts().head(10)
-        for tactic, count in attack_tactics.items():
-            print(f"    {tactic}: {count:,}")
-        
-        # Tactic transitions
-        print("\n  Most Common Tactic Transitions:")
-        transitions = pivot_df.groupby(['compromise_tactic', 'attack_tactic']).size().sort_values(ascending=False).head(10)
-        for (comp, attack), count in transitions.items():
-            print(f"    {comp} → {attack}: {count:,}")
-    
-    def analyze_attack_chains(self, pivot_df):
-        """Analyze multi-hop attack chains (A→B→C→D...)."""
-        print("\n--- ATTACK CHAIN ANALYSIS ---")
+        results = []
         
         with self.driver.session(database=self.database) as session:
-            # Find chains of length 3+ (A→B→C)
-            query = """
-            MATCH path = (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)-[r3:CONNECTS]->(d:IP)
-            WHERE r1.is_attack = 1 AND r2.is_attack = 1 AND r3.is_attack = 1
-            AND r2.timestamp > r1.timestamp
-            AND r3.timestamp > r2.timestamp
-            RETURN 
-                a.address as hop1,
-                b.address as hop2, 
-                c.address as hop3,
-                d.address as hop4,
-                r1.timestamp as t1,
-                r2.timestamp as t2,
-                r3.timestamp as t3
-            LIMIT 100
-            """
-            
-            result = session.run(query)
-            chains = [dict(record) for record in result]
-            
-            if chains:
-                print(f"  ✓ Found {len(chains):,} attack chains (3+ hops)")
+            for window_sec in tqdm(window_sizes, desc="Testing windows"):
+                window_hours = window_sec / 3600
                 
-                # Show example chain
-                if chains:
-                    chain = chains[0]
-                    print(f"\n  Example Attack Chain:")
-                    print(f"    {chain['hop1']} → {chain['hop2']} → {chain['hop3']} → {chain['hop4']}")
-                    
-                    t1 = chain['t1']
-                    t2 = chain['t2']
-                    t3 = chain['t3']
-                    print(f"    Timing: 0h → {(t2-t1)/3600:.1f}h → {(t3-t1)/3600:.1f}h")
-            else:
-                print("  No multi-hop chains found (or chains are rare)")
+                query = """
+                MATCH (victim:IP)
+                WHERE exists((victim)<-[:CONNECTS]-(:IP))
+                WITH victim LIMIT 1000  // Sample for speed
+                
+                OPTIONAL MATCH (victim)<-[r_in:CONNECTS]-(src:IP)
+                WHERE r_in.timestamp >= timestamp() - $window_sec
+                WITH victim, count(r_in) as in_degree, 
+                     sum(CASE WHEN r_in.is_attack = 1 THEN 1 ELSE 0 END) as attacks_received
+                
+                OPTIONAL MATCH (victim)-[r_out:CONNECTS]->(dst:IP)
+                WHERE r_out.timestamp >= timestamp() - $window_sec
+                WITH victim, in_degree, attacks_received, count(r_out) as out_degree
+                
+                WHERE in_degree > 0 OR out_degree > 0
+                RETURN 
+                    avg(in_degree + out_degree) as avg_degree,
+                    stdDev(in_degree + out_degree) as std_degree,
+                    avg(attacks_received) as avg_attacks,
+                    count(victim) as sample_size
+                """
+                
+                result = session.run(query, window_sec=window_sec).single()
+                
+                if result:
+                    results.append({
+                        'window_hours': window_hours,
+                        'window_seconds': window_sec,
+                        'avg_degree': float(result['avg_degree'] or 0),
+                        'std_degree': float(result['std_degree'] or 0),
+                        'avg_attacks': float(result['avg_attacks'] or 0),
+                        'sample_size': int(result['sample_size'] or 0)
+                    })
+        
+        print("\n  Window Size Comparison:")
+        for r in results:
+            print(f"    {r['window_hours']:.0f}h: avg_degree={r['avg_degree']:.2f}, "
+                  f"avg_attacks={r['avg_attacks']:.2f}, samples={r['sample_size']}")
+        
+        return results
     
-    def visualize_pivot_patterns(self, pivot_df):
-        """Create visualizations of pivot patterns."""
-        print("\n--- GENERATING VISUALIZATIONS ---")
+    def test_pivot_detection_windows(self, window_sizes: List[int]):
+        """Test different time windows for detecting pivot behavior."""
+        print("\n--- Testing Pivot Detection Windows ---")
+        
+        results = []
+        
+        with self.driver.session(database=self.database) as session:
+            for window_sec in tqdm(window_sizes, desc="Testing detection windows"):
+                window_hours = window_sec / 3600
+                
+                query = """
+                MATCH (a:IP)-[r1:CONNECTS]->(b:IP)
+                WHERE r1.is_attack = 1 AND r1.tactic = 'Reconnaissance'
+                WITH b, r1.timestamp as recon_time
+                LIMIT 500  // Sample for speed
+                
+                OPTIONAL MATCH (b)-[r2:CONNECTS]->(c:IP)
+                WHERE r2.is_attack = 1 
+                  AND r2.timestamp > recon_time
+                  AND r2.timestamp <= recon_time + $window_sec
+                
+                WITH b, recon_time, count(r2) as pivot_attacks
+                RETURN 
+                    sum(CASE WHEN pivot_attacks > 0 THEN 1 ELSE 0 END) as pivots_detected,
+                    count(b) as total_recon_victims,
+                    avg(pivot_attacks) as avg_pivot_attacks
+                """
+                
+                result = session.run(query, window_sec=window_sec).single()
+                
+                if result:
+                    total = int(result['total_recon_victims'] or 0)
+                    detected = int(result['pivots_detected'] or 0)
+                    rate = (detected / total * 100) if total > 0 else 0
+                    
+                    results.append({
+                        'window_hours': window_hours,
+                        'window_seconds': window_sec,
+                        'pivots_detected': detected,
+                        'total_victims': total,
+                        'detection_rate': rate,
+                        'avg_pivot_attacks': float(result['avg_pivot_attacks'] or 0)
+                    })
+        
+        print("\n  Detection Window Comparison:")
+        for r in results:
+            print(f"    {r['window_hours']:.0f}h: {r['pivots_detected']}/{r['total_victims']} "
+                  f"({r['detection_rate']:.1f}%) pivots detected")
+        
+        return results
+    
+    def generate_recommendations(self, pivot_timings, window_results, detection_results):
+        """Generate recommendations for optimal window sizes."""
+        print("\n--- Generating Recommendations ---")
+        
+        recommendations = {}
+        
+        # Recommend historical window (capture 75th percentile of activity)
+        if window_results:
+            # Choose window with good degree coverage but not too sparse
+            recommended_hist = max(
+                [w for w in window_results if w['avg_degree'] > 5],
+                key=lambda x: x['avg_degree'],
+                default=window_results[2] if len(window_results) > 2 else window_results[0]
+            )
+            recommendations['historical_window'] = {
+                'seconds': recommended_hist['window_seconds'],
+                'hours': recommended_hist['window_hours'],
+                'rationale': f"Captures sufficient activity (avg degree: {recommended_hist['avg_degree']:.2f})"
+            }
+        
+        # Recommend detection window (capture 75-90th percentile of pivots)
+        if pivot_timings and 'percentiles' in pivot_timings:
+            p75_hours = pivot_timings['percentiles']['p75']
+            p90_hours = pivot_timings['percentiles']['p90']
+            
+            # Find detection window closest to P75-P90 range
+            if detection_results:
+                recommended_det = min(
+                    detection_results,
+                    key=lambda x: abs(x['window_hours'] - p75_hours)
+                )
+                recommendations['detection_window'] = {
+                    'seconds': recommended_det['window_seconds'],
+                    'hours': recommended_det['window_hours'],
+                    'rationale': f"Captures {recommended_det['detection_rate']:.1f}% of pivots, "
+                                f"aligned with P75 timing ({p75_hours:.1f}h)"
+                }
+        
+        print("\n  Recommendations:")
+        for key, rec in recommendations.items():
+            print(f"    {key}: {rec['hours']:.0f} hours ({rec['seconds']} seconds)")
+            print(f"      Rationale: {rec['rationale']}")
+        
+        return recommendations
+    
+    def visualize_temporal_analysis(self, results):
+        """Generate visualizations for temporal analysis."""
+        print("\n--- Generating Visualizations ---")
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         
-        # 1. Time to attack histogram
+        # Plot 1: Pivot timing distribution (if available)
         ax = axes[0, 0]
-        pivot_df[pivot_df['hours_to_attack'] <= 168]['hours_to_attack'].hist(bins=50, ax=ax, edgecolor='black')
-        ax.axvline(24, color='red', linestyle='--', label='24 hours')
-        ax.set_xlabel('Hours Between Compromise and Attack')
-        ax.set_ylabel('Frequency')
-        ax.set_title('Distribution of Time to Pivot Attack (≤1 week)')
-        ax.legend()
+        if 'pivot_timings' in results and 'percentiles' in results['pivot_timings']:
+            percentiles = results['pivot_timings']['percentiles']
+            p_names = list(percentiles.keys())
+            p_values = list(percentiles.values())
+            
+            ax.bar(p_names, p_values, color='steelblue', edgecolor='black')
+            ax.axhline(results['pivot_timings']['median_hours'], color='red', 
+                      linestyle='--', label=f"Median: {results['pivot_timings']['median_hours']:.1f}h")
+            ax.set_xlabel('Percentile')
+            ax.set_ylabel('Hours to Pivot')
+            ax.set_title('Pivot Timing Distribution')
+            ax.legend()
+            ax.grid(alpha=0.3, axis='y')
         
-        # 2. Compromise tactics
+        # Plot 2: Historical window comparison
         ax = axes[0, 1]
-        top_comp = pivot_df['compromise_tactic'].value_counts().head(10)
-        top_comp.plot(kind='barh', ax=ax, color='steelblue')
-        ax.set_xlabel('Count')
-        ax.set_title('Top 10 Compromise Tactics')
+        if 'historical_window_tests' in results and results['historical_window_tests']:
+            df_hist = pd.DataFrame(results['historical_window_tests'])
+            ax.plot(df_hist['window_hours'], df_hist['avg_degree'], 
+                   marker='o', linewidth=2, label='Avg Degree')
+            ax.set_xlabel('Historical Window (hours)')
+            ax.set_ylabel('Average Degree')
+            ax.set_title('Activity Capture vs Window Size')
+            ax.grid(alpha=0.3)
+            ax.legend()
         
-        # 3. Attack tactics
+        # Plot 3: Detection window comparison
         ax = axes[1, 0]
-        top_attack = pivot_df['attack_tactic'].value_counts().head(10)
-        top_attack.plot(kind='barh', ax=ax, color='coral')
-        ax.set_xlabel('Count')
-        ax.set_title('Top 10 Subsequent Attack Tactics')
+        if 'detection_window_tests' in results and results['detection_window_tests']:
+            df_det = pd.DataFrame(results['detection_window_tests'])
+            ax.plot(df_det['window_hours'], df_det['detection_rate'], 
+                   marker='o', linewidth=2, color='coral')
+            ax.set_xlabel('Detection Window (hours)')
+            ax.set_ylabel('Pivot Detection Rate (%)')
+            ax.set_title('Pivot Detection Rate vs Window Size')
+            ax.grid(alpha=0.3)
         
-        # 4. Pivot IPs - how many times did each pivot?
+        # Plot 4: Recommendations summary
         ax = axes[1, 1]
-        pivot_counts = pivot_df['pivot_ip'].value_counts().head(20)
-        pivot_counts.plot(kind='bar', ax=ax, color='darkgreen')
-        ax.set_xlabel('Pivot IP (top 20)')
-        ax.set_ylabel('Number of Times Used as Pivot')
-        ax.set_title('Most Frequently Used Pivot IPs')
-        ax.tick_params(axis='x', rotation=45)
+        ax.axis('off')
+        
+        if 'recommendations' in results:
+            rec_text = "RECOMMENDED WINDOWS\n\n"
+            for key, rec in results['recommendations'].items():
+                rec_text += f"{key.replace('_', ' ').title()}:\n"
+                rec_text += f"  {rec['hours']:.0f} hours\n"
+                rec_text += f"  {rec['rationale']}\n\n"
+            
+            ax.text(0.1, 0.9, rec_text, transform=ax.transAxes,
+                   fontsize=12, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
-        plt.savefig('killchain_analysis.png', dpi=150, bbox_inches='tight')
-        print("  ✓ Saved visualizations to 'killchain_analysis.png'")
-        
-        # Save pivot data to CSV for further analysis
-        pivot_df.to_csv('pivot_nodes.csv', index=False)
-        print("  ✓ Saved pivot node data to 'pivot_nodes.csv'")
+        plt.savefig('temporal_window_analysis.png', dpi=150, bbox_inches='tight')
+        print("  ✓ Saved visualizations to 'temporal_window_analysis.png'")
 
 
-class ThesisAnalyzer(Neo4jConnection):
+class SubnetPivotAnalyzer(Neo4jConnection):
     """
-    A comprehensive class to manage the entire data pipeline for the thesis project.
-    Inherits connection logic from Neo4jConnection.
+    Subnet-aware pivot detection using FastRP embeddings.
+    Implements both label-aware and label-agnostic analysis modes.
     """
     
-    def __init__(self, uri, user, password, database="neo4j"):
-        # This single line replaces the original __init__, connect, and close methods
-        super().__init__(uri, user, password, database)
+    def __init__(self, connection: Optional[Neo4jConnection] = None,
+                 uri="bolt://localhost:7687", user="neo4j", password="ubuntuubuntu",
+                 database="neo4j", container_name="neo4j_subnet_analyzer", **kwargs):
+        if connection is not None:
+            self._shared_connection = connection
+            self.driver = connection.driver
+            self.uri = connection.uri
+            self.user = connection.user
+            self.password = connection.password
+            self.database = connection.database
+            self.container_name = connection.container_name
+            self._owns_driver = False
+        else:
+            super().__init__(uri=uri, user=user, password=password,
+                             database=database, container_name=container_name, **kwargs)
+            self._shared_connection = None
+            self._owns_driver = True
 
-    # ==============================================================================
-    # === DATABASE BUILDING METHODS ================================================
-    # ==============================================================================
+    def start(self, password: Optional[str] = None):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.start(password)
+        return super().start(password)
 
-    def build_database(self, rebuild=True):
-        """
-        Orchestrates the entire database construction process.
-        
-        Args:
-            rebuild (bool, optional): If True (default), the existing database will be
-                                      wiped clean before loading new data. If False,
-                                      new data will be added to the existing graph.
-        """
-        print("Starting database build process...")
-        
-        # Download and prepare data
-        df = self._download_and_prepare_data()
-        if df is None:
-            print("Failed to prepare data. Aborting.")
+    def stop(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.stop()
+        return super().stop()
+
+    def remove(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.remove()
+        return super().remove()
+
+    def restart(self):
+        if getattr(self, "_shared_connection", None):
+            return self._shared_connection.restart()
+        return super().restart()
+
+    def connect(self):
+        if getattr(self, "_shared_connection", None):
+            ok = self._shared_connection.connect()
+            self.driver = self._shared_connection.driver
+            return ok
+        return super().connect()
+
+    def close(self):
+        if getattr(self, "_shared_connection", None):
+            print("Shared connection managed by controller; not closing driver here.")
             return
-        
-        try:
-            if self.connect():
-                self._write_dataframe_to_neo4j(df, rebuild=rebuild)
-                print("\nDatabase build process finished successfully.")
-        finally:
-            self.close()
-
-    def _download_and_prepare_data(self):
-        """Downloads Zeek data and returns as DataFrame."""
-        print("Step 1: Loading and Preparing Data...")
-        BASE_URL = "https://datasets.uwf.edu/data/UWF-ZeekData24/parquet/"
-        all_dataframes = []
-        
-        try:
-            directory_urls = self._get_directory_urls(BASE_URL)
-            print(f"Found {len(directory_urls)} directories to process...")
-            
-            for dir_url in directory_urls:
-                response = requests.get(dir_url)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                parquet_urls = [urljoin(dir_url, link.get('href')) 
-                              for link in soup.find_all('a') 
-                              if link.get('href').endswith('.parquet')]
-                
-                print(f"  Processing directory: {dir_url.split('/')[-2]}")
-                for url in parquet_urls:
-                    print(f"    Loading: {url.split('/')[-1]}")
-                    all_dataframes.append(pd.read_parquet(url, engine='pyarrow'))
-            
-            if not all_dataframes:
-                raise ValueError("No dataframes were loaded.")
-            
-            print("\nCombining and cleaning data...")
-            combined_df = pd.concat(all_dataframes, ignore_index=True)
-            cleaned_df = combined_df[combined_df['label_technique'] != 'Duplicate'].copy().head(500_000)
-            
-            print(f"Prepared {len(cleaned_df):,} rows for import.")
-            return cleaned_df
-            
-        except Exception as e:
-            print(f"Error during data preparation: {e}")
-            return None
-
-    def _get_directory_urls(self, base_url):
-        """Helper to fetch subdirectory URLs."""
-        response = requests.get(base_url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        return [urljoin(base_url, link.get('href')) 
-                for link in soup.find_all('a') 
-                if link.get('href') and link.get('href').startswith('2024') 
-                and link.get('href').endswith('/')]
-
-    def _write_dataframe_to_neo4j(self, df, rebuild=True):
-        """Write DataFrame directly to Neo4j - optimized for large datasets."""
-        print("\nStep 2: Writing Data to Neo4j...")
-        
-        with self.driver.session(database=self.database) as session:
-            if rebuild:
-                print("Rebuild flag is True. Clearing database in batches...")
-                deleted = 1
-                total_deleted = 0
-                while deleted > 0:
-                    result = session.run("""
-                        MATCH (n)
-                        WITH n LIMIT 10000
-                        DETACH DELETE n
-                        RETURN count(n) as deleted
-                    """)
-                    deleted = result.single()["deleted"]
-                    total_deleted += deleted
-                    if deleted > 0:
-                        print(f"  Cleared {total_deleted:,} nodes...")
-                print(f"  ✓ Database cleared ({total_deleted:,} nodes total)")
-            
-            # Create index FIRST (critical for performance)
-            print("\nCreating indexes...")
-            session.run("CREATE INDEX ip_address_index IF NOT EXISTS FOR (n:IP) ON (n.address)")
-            print("  ✓ Index created for IP addresses")
-            
-            # Prepare data
-            total_rows = len(df)
-            batch_size = 5000  # Optimal batch size for Neo4j
-            
-            print(f"\nWriting {total_rows:,} rows in batches of {batch_size:,}...")
-            
-            start_time = time.time()
-            
-            for i in range(0, total_rows, batch_size):
-                batch = df.iloc[i:i+batch_size].copy()
-                
-                # Convert label_binary to integer (0/1) for GDS compatibility
-                batch['label_binary'] = batch['label_binary'].astype(bool).astype(int)
-                
-                # Convert to records - only select needed columns
-                records = batch[[
-                    'src_ip_zeek', 'dest_ip_zeek', 'ts', 'duration', 
-                    'service', 'dest_port_zeek', 'conn_state', 
-                    'label_tactic', 'label_technique', 'label_binary'
-                ]].to_dict('records')
-                
-                # Optimized query with MERGE for IPs (avoids duplicates)
-                query = """
-                UNWIND $records AS row
-                MERGE (orig:IP {address: row.src_ip_zeek})
-                MERGE (resp:IP {address: row.dest_ip_zeek})
-                CREATE (orig)-[:CONNECTS {
-                    timestamp: row.ts,
-                    duration: row.duration,
-                    service: row.service,
-                    port: row.dest_port_zeek,
-                    state: row.conn_state,
-                    tactic: row.label_tactic,
-                    technique: row.label_technique,
-                    is_attack: row.label_binary
-                }]->(resp)
-                """
-                
-                session.run(query, records=records)
-                
-                # Progress tracking
-                progress = min(i + batch_size, total_rows)
-                pct = (progress / total_rows) * 100
-                elapsed = time.time() - start_time
-                rate = progress / elapsed if elapsed > 0 else 0
-                eta = (total_rows - progress) / rate if rate > 0 else 0
-                
-                print(f"  Progress: {progress:,}/{total_rows:,} ({pct:.1f}%) | "
-                      f"Rate: {rate:.0f} rows/sec | ETA: {eta/60:.1f} min")
-            
-            total_time = time.time() - start_time
-            print(f"\n✓ Data writing complete in {total_time/60:.1f} minutes")
-            print(f"  Average rate: {total_rows/total_time:.0f} rows/sec")
-
-    # ==============================================================================
-    # === DATABASE ANALYSIS METHODS ================================================
-    # ==============================================================================
+        return super().close()
     
-    def run_analysis(self):
-        """
-        Connects to the database and runs the full analysis pipeline.
-        (Hypothesis Test, Verification Query, and Visualization)
-        """
+    @staticmethod
+    def ip_to_subnet(ip_address: str, prefix_len: int = 24) -> str:
+        """Convert IP address to subnet notation (e.g., '192.168.1.0/24')."""
         try:
-            self.connect()
-            if self.driver:
-                self.test_pivot_prediction()
-                self.run_verification_query()
-                self.visualize_attack_graph()
-        finally:
-            self.close()
-
-    def test_pivot_prediction(self):
-        """
-        Tests the core hypothesis: Can GNN embeddings predict which reconnaissance 
-        victims will become pivots?
-        """
-        print("\n" + "="*80)
-        print("PIVOT PREDICTION ANALYSIS")
-        print("="*80)
+            network = ipaddress.ip_network(f"{ip_address}/{prefix_len}", strict=False)
+            return str(network)
+        except:
+            return None
+    
+    def add_subnet_labels(self):
+        """Add subnet property and numeric subnet ID to all IP nodes."""
+        print("\n--- Adding Subnet Labels to IP Nodes ---")
         
         with self.driver.session(database=self.database) as session:
-            # Drop existing graph projection if it exists
-            try: 
-                session.run("CALL gds.graph.drop('pivotGraph', false)")
-            except Exception: 
-                pass
+            # First pass: Add subnet strings
+            print("  Adding subnet strings...")
+            subnet_query = """
+            MATCH (n:IP)
+            WHERE n.subnet IS NULL
+            WITH n, split(n.address, '.') as parts
+            SET n.subnet = parts[0] + '.' + parts[1] + '.' + parts[2] + '.0/24'
+            """
+            session.run(subnet_query)
             
-            print("\n1. Projecting graph into GDS...")
-            session.run("""
-                CALL gds.graph.project(
-                    'pivotGraph', 
-                    'IP', 
-                    {CONNECTS: {properties: 'is_attack'}}
-                )
-            """)
-            print("   ✓ Graph projected")
-            
-            print("\n2. Generating node embeddings with FastRP...")
-            result = session.run("""
-                CALL gds.fastRP.write('pivotGraph', {
-                    embeddingDimension: 128, 
-                    writeProperty: 'embedding',
-                    randomSeed: 42
-                })
-                YIELD nodePropertiesWritten
-                RETURN nodePropertiesWritten
-            """)
-            nodes_updated = result.single()['nodePropertiesWritten']
-            print(f"   ✓ Created embeddings for {nodes_updated:,} nodes")
-            
-            print("\n3. Identifying reconnaissance victims and their outcomes...")
-            
-            # Get all IPs that received reconnaissance attacks
-            victims_query = """
-            MATCH (attacker:IP)-[r:CONNECTS]->(victim:IP)
-            WHERE r.is_attack = 1 
-              AND r.tactic = 'Reconnaissance'
-              AND victim.embedding IS NOT NULL
-            WITH DISTINCT victim
-            
-            // Check if this victim later became an attacker
-            OPTIONAL MATCH (victim)-[r2:CONNECTS]->(target:IP)
-            WHERE r2.is_attack = 1
-            
-            RETURN 
-                victim.address AS ip,
-                victim.embedding AS embedding,
-                count(r2) > 0 AS became_pivot
+            # Second pass: Create subnet mapping
+            print("  Creating subnet ID mapping...")
+            # Collect distinct subnet strings and assign deterministic integer IDs
+            # using UNWIND over a range (avoids unsupported window functions)
+            mapping_query = """
+            MATCH (n:IP)
+            WITH collect(DISTINCT n.subnet) AS subs
+            UNWIND range(0, size(subs)-1) AS idx
+            WITH subs[idx] AS subnet, idx AS subnet_id, subs
+            MATCH (m:IP)
+            WHERE m.subnet = subnet
+            SET m.subnet_id = subnet_id
+            RETURN size(subs) AS subnet_count
             """
             
-            result = session.run(victims_query)
-            victims = [dict(record) for record in result]
+            result = session.run(mapping_query).single()
+            print(f"  ✓ Assigned numeric IDs to {result['subnet_count']} subnets")
             
-            if not victims:
-                print("   ✗ No reconnaissance victims found with embeddings")
+            # Create indices
+            session.run("CREATE INDEX subnet_index IF NOT EXISTS FOR (n:IP) ON (n.subnet)")
+            session.run("CREATE INDEX subnet_id_index IF NOT EXISTS FOR (n:IP) ON (n.subnet_id)")
+            print("  ✓ Subnet indices created")
+    
+    def run_full_analysis(self, mode='both', historical_window_hours=24, 
+                         detection_window_hours=24, embedding_dim=128):
+        """
+        Run complete subnet-aware pivot prediction analysis.
+        
+        Args:
+            mode: 'label_aware', 'label_agnostic', or 'both'
+            historical_window_hours: Hours of history to consider before reconnaissance
+            detection_window_hours: Hours after reconnaissance to check for pivot behavior
+            embedding_dim: Dimension of FastRP embeddings
+        """
+        try:
+            if not self.connect():
+                print("Could not connect to Neo4j; aborting analysis.")
                 return
-            
-            victims_df = pd.DataFrame(victims)
-            
-            pivot_count = victims_df['became_pivot'].sum()
-            non_pivot_count = len(victims_df) - pivot_count
-            
-            print(f"   ✓ Found {len(victims_df)} reconnaissance victims:")
-            print(f"      - Became pivots: {pivot_count} ({pivot_count/len(victims_df)*100:.1f}%)")
-            print(f"      - Did NOT pivot: {non_pivot_count} ({non_pivot_count/len(victims_df)*100:.1f}%)")
-            
-            if pivot_count == 0:
-                print("   ✗ No pivots found - cannot test hypothesis")
-                return
-            
-            print("\n4. Computing embedding similarities...")
-            
-            # Separate pivots and non-pivots
-            pivot_embeddings = np.array([v['embedding'] for v in victims if v['became_pivot']])
-            non_pivot_embeddings = np.array([v['embedding'] for v in victims if not v['became_pivot']])
-            
-            # Compute reference pivot embedding (mean of all pivots)
-            reference_pivot_embedding = np.mean(pivot_embeddings, axis=0)
-            
-            # Compute similarities for all victims
-            similarities = []
-            for victim in victims:
-                victim_emb = np.array(victim['embedding']).reshape(1, -1)
-                ref_emb = reference_pivot_embedding.reshape(1, -1)
-                sim = cosine_similarity(victim_emb, ref_emb)[0][0]
-                similarities.append({
-                    'ip': victim['ip'],
-                    'similarity': sim,
-                    'actual_pivot': victim['became_pivot']
-                })
-            
-            similarity_df = pd.DataFrame(similarities)
-            
-            # Statistical analysis
-            pivot_sims = similarity_df[similarity_df['actual_pivot']]['similarity']
-            non_pivot_sims = similarity_df[~similarity_df['actual_pivot']]['similarity']
-            
-            print(f"\n   Similarity Statistics:")
-            print(f"      Pivots:     mean={pivot_sims.mean():.4f}, median={pivot_sims.median():.4f}, std={pivot_sims.std():.4f}")
-            print(f"      Non-pivots: mean={non_pivot_sims.mean():.4f}, median={non_pivot_sims.median():.4f}, std={non_pivot_sims.std():.4f}")
-            print(f"      Difference: {pivot_sims.mean() - non_pivot_sims.mean():.4f}")
-            
-            # Statistical test
-            from scipy import stats
-            t_stat, p_value = stats.ttest_ind(pivot_sims, non_pivot_sims)
-            print(f"\n   Welch's t-test: t={t_stat:.4f}, p={p_value:.6f}")
-            
-            if p_value < 0.05:
-                print(f"   ✓ STATISTICALLY SIGNIFICANT (p < 0.05)")
-            else:
-                print(f"   ✗ Not statistically significant (p >= 0.05)")
-            
-            # Find optimal threshold using ROC curve
-            print("\n5. Finding optimal classification threshold...")
-            
-            fpr, tpr, thresholds = roc_curve(
-                similarity_df['actual_pivot'], 
-                similarity_df['similarity']
-            )
-            roc_auc = auc(fpr, tpr)
-            
-            # Find threshold that maximizes F1 score
-            f1_scores = []
-            for threshold in thresholds:
-                predictions = similarity_df['similarity'] >= threshold
-                tp = ((predictions) & (similarity_df['actual_pivot'])).sum()
-                fp = ((predictions) & (~similarity_df['actual_pivot'])).sum()
-                fn = ((~predictions) & (similarity_df['actual_pivot'])).sum()
-                
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                f1_scores.append(f1)
-            
-            optimal_idx = np.argmax(f1_scores)
-            optimal_threshold = thresholds[optimal_idx]
-            
-            print(f"   ✓ Optimal threshold: {optimal_threshold:.4f}")
-            print(f"   ✓ AUC-ROC: {roc_auc:.4f}")
-            
-            # Make predictions with optimal threshold
-            print("\n6. Evaluating predictions with optimal threshold...")
-            
-            similarity_df['predicted_pivot'] = similarity_df['similarity'] >= optimal_threshold
-            
-            # Confusion matrix
-            cm = confusion_matrix(
-                similarity_df['actual_pivot'], 
-                similarity_df['predicted_pivot']
-            )
-            
-            tn, fp, fn, tp = cm.ravel()
-            
-            accuracy = (tp + tn) / len(similarity_df)
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
             
             print("\n" + "="*80)
-            print("HYPOTHESIS TEST RESULTS")
+            print("SUBNET-AWARE PIVOT PREDICTION WITH FASTRP EMBEDDINGS")
             print("="*80)
-            print(f"\nConfusion Matrix:")
-            print(f"                    Predicted Non-Pivot    Predicted Pivot")
-            print(f"Actual Non-Pivot           {tn:5d}                {fp:5d}")
-            print(f"Actual Pivot               {fn:5d}                {tp:5d}")
+            print(f"  Mode: {mode.upper()}")
+            print(f"  Historical window: {historical_window_hours} hours")
+            print(f"  Detection window: {detection_window_hours} hours")
+            print(f"  Embedding dimension: {embedding_dim}")
             
-            print(f"\nPerformance Metrics:")
-            print(f"  Accuracy:  {accuracy*100:.2f}%")
-            print(f"  Precision: {precision*100:.2f}%")
-            print(f"  Recall:    {recall*100:.2f}%")
-            print(f"  F1-Score:  {f1:.4f}")
-            print(f"  AUC-ROC:   {roc_auc:.4f}")
+            # Add subnet labels if not already present
+            self.add_subnet_labels()
             
-            print(f"\n" + "="*80)
-            if accuracy >= 0.80:
-                print("✓ HYPOTHESIS SUPPORTED: Accuracy ≥ 80%")
-                print("  Graph structural embeddings successfully predict pivot behavior")
-            else:
-                print("✗ HYPOTHESIS NOT SUPPORTED: Accuracy < 80%")
-                print("  Structural features alone may be insufficient")
-            print("="*80)
+            # Run analysis based on mode
+            if mode in ['label_aware', 'both']:
+                print("\n" + "="*80)
+                print("RUNNING LABEL-AWARE ANALYSIS")
+                print("="*80)
+                self.run_pivot_prediction(
+                    use_labels=True,
+                    historical_window_hours=historical_window_hours,
+                    detection_window_hours=detection_window_hours,
+                    embedding_dim=embedding_dim,
+                    output_prefix='label_aware'
+                )
             
-            # Save results
-            similarity_df.to_csv('pivot_predictions.csv', index=False)
-            print(f"\n✓ Detailed predictions saved to 'pivot_predictions.csv'")
+            if mode in ['label_agnostic', 'both']:
+                print("\n" + "="*80)
+                print("RUNNING LABEL-AGNOSTIC ANALYSIS")
+                print("="*80)
+                self.run_pivot_prediction(
+                    use_labels=False,
+                    historical_window_hours=historical_window_hours,
+                    detection_window_hours=detection_window_hours,
+                    embedding_dim=embedding_dim,
+                    output_prefix='label_agnostic'
+                )
             
-            # Plot ROC curve
-            plt.figure(figsize=(10, 8))
-            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random guess')
-            plt.xlim([0.0, 1.0])
-            plt.ylim([0.0, 1.05])
-            plt.xlabel('False Positive Rate')
-            plt.ylabel('True Positive Rate')
-            plt.title('ROC Curve: Pivot Prediction Using GNN Embeddings')
-            plt.legend(loc="lower right")
-            plt.grid(alpha=0.3)
-            plt.savefig('roc_curve.png', dpi=150, bbox_inches='tight')
-            print(f"✓ ROC curve saved to 'roc_curve.png'")
-
-    def run_verification_query(self):
-        """Finds and prints example attack paths from the graph."""
-        print("\n--- VERIFYING ATTACK PATHS ---")
-        query = """
-        MATCH (a:IP)-[r:CONNECTS]->(v:IP) 
-        WHERE r.is_attack = 1 AND r.tactic <> 'none' AND r.tactic <> 'Duplicate' 
-        RETURN a.address AS attacker_ip, v.address AS victim_ip, r.port AS port, r.tactic AS tactic 
-        LIMIT 10
-        """
+            # Compare results if both modes were run
+            if mode == 'both':
+                self.compare_analysis_modes()
+            
+        finally:
+            self.close()
+    
+    def drop_graph_projection(self, graph_name: str) -> bool:
+        """Safely drop a graph projection if it exists."""
         with self.driver.session(database=self.database) as session:
+            try:
+                # Direct drop attempt first
+                drop_query = "CALL gds.graph.drop($name)"
+                session.run(drop_query, name=graph_name)
+                return True
+            except Exception:
+                try:
+                    # Check if it exists
+                    exists_query = "CALL gds.graph.exists($name) YIELD exists RETURN exists"
+                    result = session.run(exists_query, name=graph_name).single()
+                    if not result or not result['exists']:
+                        return True
+                    print(f"  ⚠ Failed to drop projection: {graph_name}")
+                    return False
+                except Exception as e:
+                    print(f"  ⚠ Error checking projection {graph_name}: {str(e)}")
+                    return False
+
+    def drop_all_graph_projections(self):
+        """Drop all existing graph projections."""
+        print("\n--- Dropping All Existing Graph Projections ---")
+        
+        with self.driver.session(database=self.database) as session:
+            try:
+                # Check existing projections first
+                exists_query = """
+                CALL gds.graph.exists($name)
+                YIELD exists
+                RETURN exists
+                """
+                
+                # Try to drop structure projection if it exists
+                result = session.run(exists_query, name=f"pivot_graph_labeled_structure").single()
+                if result and result['exists']:
+                    session.run("CALL gds.graph.drop($name)", 
+                              name="pivot_graph_labeled_structure")
+                    print(f"  ✓ Dropped structure projection")
+                
+                # Try to drop labels projection if it exists
+                result = session.run(exists_query, name=f"pivot_graph_labeled_labels").single()
+                if result and result['exists']:
+                    session.run("CALL gds.graph.drop($name)", 
+                              name="pivot_graph_labeled_labels")
+                    print(f"  ✓ Dropped labels projection")
+                
+                # Try to drop unlabeled projection if it exists
+                result = session.run(exists_query, name=f"pivot_graph_unlabeled").single()
+                if result and result['exists']:
+                    session.run("CALL gds.graph.drop($name)",
+                              name="pivot_graph_unlabeled")
+                    print(f"  ✓ Dropped unlabeled projection")
+                
+            except Exception as e:
+                print(f"  ⚠ Warning: {str(e)}")
+                # Continue execution even if cleanup fails
+    
+    def create_graph_projection(self, projection_name: str, use_labels: bool):
+        """Create Neo4j GDS graph projection for FastRP."""
+        print(f"\n--- Creating Graph Projection: {projection_name} ---")
+        
+        # First ensure all existing projections are cleaned up
+        self.drop_all_graph_projections()
+        
+        with self.driver.session(database=self.database) as session:
+            # Create projection with or without relationship properties
+            if use_labels:
+                # Ensure old projections are dropped
+                struct_name = f"{projection_name}_structure"
+                
+                # Check if projection exists before trying to drop
+                try:
+                    exists_result = session.run(
+                        "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+                        name=struct_name
+                    ).single()
+                    
+                    if exists_result and exists_result['exists']:
+                        session.run("CALL gds.graph.drop($name)", name=struct_name)
+                        print(f"  ✓ Dropped existing structure projection")
+                except Exception as e:
+                    # Ignore errors - projection doesn't exist or already dropped
+                    pass
+                
+                # Create structure projection with UNDIRECTED orientation
+                # (required for clustering coefficient)
+                create_query = """
+                CALL gds.graph.project(
+                    $name,
+                    'IP',
+                    {
+                        CONNECTS: {
+                            orientation: 'UNDIRECTED'
+                        }
+                    },
+                    {
+                        nodeProperties: ['subnet_id']
+                    }
+                )
+                YIELD graphName, nodeCount, relationshipCount
+                RETURN graphName, nodeCount, relationshipCount
+                """
+                result = session.run(create_query, name=struct_name).single()
+                if result:
+                    print(f"  ✓ Created structure projection: {result['graphName']}")
+                    print(f"    Nodes: {result['nodeCount']:,}")
+                    print(f"    Relationships: {result['relationshipCount']:,}")
+                else:
+                    print("  ⚠ Error: Failed to create structure projection")
+                    return
+                
+                # Second projection for attack labels
+                labels_name = f"{projection_name}_labels"
+                
+                # Check if projection exists before trying to drop
+                try:
+                    exists_result = session.run(
+                        "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+                        name=labels_name
+                    ).single()
+                    
+                    if exists_result and exists_result['exists']:
+                        session.run("CALL gds.graph.drop($name)", name=labels_name)
+                        print(f"  ✓ Dropped existing labels projection")
+                except Exception as e:
+                    # Ignore errors - projection doesn't exist or already dropped
+                    pass
+                
+                labels_query = """
+                CALL gds.graph.project(
+                    $name,
+                    'IP',
+                    {
+                        CONNECTS: {
+                            properties: ['is_attack'],
+                            orientation: 'UNDIRECTED'
+                        }
+                    }
+                )
+                YIELD graphName, nodeCount, relationshipCount
+                RETURN graphName, nodeCount, relationshipCount
+                """
+                result = session.run(labels_query, name=labels_name).single()
+                if result:
+                    print(f"  ✓ Created labels projection: {result['graphName']}")
+                    print(f"    Nodes: {result['nodeCount']:,}")
+                    print(f"    Relationships: {result['relationshipCount']:,}")
+                else:
+                    print("  ⚠ Error: Failed to create labels projection")
+                    return
+            else:
+                # Check if projection exists before trying to drop
+                try:
+                    exists_result = session.run(
+                        "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+                        name=projection_name
+                    ).single()
+                    
+                    if exists_result and exists_result['exists']:
+                        session.run("CALL gds.graph.drop($name)", name=projection_name)
+                        print(f"  ✓ Dropped existing projection")
+                except Exception as e:
+                    # Ignore errors - projection doesn't exist or already dropped
+                    pass
+                
+                # Single projection for structure only with UNDIRECTED orientation
+                # (required for clustering coefficient)
+                create_query = """
+                CALL gds.graph.project(
+                    $name,
+                    'IP',
+                    {
+                        CONNECTS: {
+                            orientation: 'UNDIRECTED'
+                        }
+                    },
+                    {
+                        nodeProperties: ['subnet_id']
+                    }
+                )
+                YIELD graphName, nodeCount, relationshipCount
+                RETURN graphName, nodeCount, relationshipCount
+                """
+                result = session.run(create_query, name=projection_name).single()
+                if result:
+                    print(f"  ✓ Created projection: {result['graphName']}")
+                    print(f"    Nodes: {result['nodeCount']:,}")
+                    print(f"    Relationships: {result['relationshipCount']:,}")
+                else:
+                    print("  ⚠ Error: Failed to create projection")
+                    return
+    
+    def compute_fastrp_embeddings(self, projection_name: str, embedding_dim: int, 
+                                  use_labels: bool):
+        """Compute FastRP embeddings using Neo4j GDS."""
+        print(f"\n--- Computing FastRP Embeddings (dim={embedding_dim}) ---")
+        
+        with self.driver.session(database=self.database) as session:
+            if use_labels:
+                # First compute structural embeddings
+                query = f"""
+                CALL gds.fastRP.write(
+                    '{projection_name}_structure',
+                    {{
+                        embeddingDimension: {embedding_dim},
+                        iterationWeights: [0.0, 1.0, 1.0, 1.0],
+                        normalizationStrength: 0.5,
+                        writeProperty: 'embedding_structure'
+                    }}
+                )
+                YIELD nodePropertiesWritten, computeMillis
+                RETURN nodePropertiesWritten, computeMillis
+                """
+                result = session.run(query).single()
+                if result:
+                    print(f"  ✓ Structural embeddings computed in {result['computeMillis']/1000.0:.2f}s")
+                else:
+                    print("  ⚠ Error: Failed to compute structural embeddings")
+                    return
+                
+                # Then compute label-aware embeddings
+                query = f"""
+                CALL gds.fastRP.write(
+                    '{projection_name}_labels',
+                    {{
+                        embeddingDimension: {embedding_dim},
+                        relationshipWeightProperty: 'is_attack',
+                        iterationWeights: [0.0, 1.0, 1.0, 1.0],
+                        normalizationStrength: 0.5,
+                        writeProperty: 'embedding_labels'
+                    }}
+                )
+                YIELD nodePropertiesWritten, computeMillis
+                RETURN nodePropertiesWritten, computeMillis
+                """
+                result = session.run(query).single()
+                if result:
+                    print(f"  ✓ Label embeddings computed in {result['computeMillis']/1000.0:.2f}s")
+                else:
+                    print("  ⚠ Error: Failed to compute label embeddings")
+                    return
+                
+                # Combine embeddings
+                query = """
+                MATCH (n:IP)
+                WHERE n.embedding_structure IS NOT NULL AND n.embedding_labels IS NOT NULL
+                SET n.embedding_label_aware = n.embedding_structure + n.embedding_labels
+                WITH count(n) as nodes_updated
+                RETURN nodes_updated
+                """
+                result = session.run(query).single()
+                print(f"  ✓ Combined embeddings for {result['nodes_updated']:,} nodes")
+                
+                write_property = 'embedding_label_aware'
+            else:
+                # Pure structural embeddings
+                query = f"""
+                CALL gds.fastRP.write(
+                    '{projection_name}',
+                    {{
+                        embeddingDimension: {embedding_dim},
+                        iterationWeights: [0.0, 1.0, 1.0, 1.0],
+                        normalizationStrength: 0.5,
+                        writeProperty: 'embedding_label_agnostic'
+                    }}
+                )
+                YIELD nodePropertiesWritten, computeMillis
+                RETURN nodePropertiesWritten, computeMillis
+                """
+                result = session.run(query).single()
+                if result:
+                    print(f"  ✓ Embeddings computed in {result['computeMillis']/1000.0:.2f}s")
+                    print(f"    Nodes with embeddings: {result['nodePropertiesWritten']:,}")
+                    print(f"    Property name: embedding_label_agnostic")
+                else:
+                    print("  ⚠ Error: Failed to compute embeddings")
+                    return
+    
+    def compute_centrality_metrics(self, projection_name: str):
+        """Compute PageRank, Betweenness, and Clustering Coefficient."""
+        print(f"\n--- Computing Centrality Metrics ---")
+        
+        with self.driver.session(database=self.database) as session:
+            # PageRank
+            print("  Computing PageRank...")
+            pr_query = f"""
+            CALL gds.pageRank.write(
+                '{projection_name}',
+                {{
+                    writeProperty: 'pagerank',
+                    maxIterations: 20,
+                    dampingFactor: 0.85
+                }}
+            )
+            YIELD nodePropertiesWritten, ranIterations
+            RETURN nodePropertiesWritten
+            """
+            result = session.run(pr_query).single()
+            print(f"    ✓ PageRank: {result['nodePropertiesWritten']:,} nodes")
+            
+            # Betweenness Centrality (sampled for performance)
+            print("  Computing Betweenness Centrality (sampled)...")
+            bc_query = f"""
+            CALL gds.betweenness.write(
+                '{projection_name}',
+                {{
+                    writeProperty: 'betweenness',
+                    samplingSize: 1000,
+                    samplingSeed: 42
+                }}
+            )
+            YIELD nodePropertiesWritten, computeMillis
+            RETURN nodePropertiesWritten, computeMillis
+            """
+            result = session.run(bc_query).single()
+            print(f"    ✓ Betweenness: {result['nodePropertiesWritten']:,} nodes in {result['computeMillis']/1000:.2f}s")
+            
+            # Local Clustering Coefficient
+            print("  Computing Clustering Coefficient...")
+            cc_query = f"""
+            CALL gds.localClusteringCoefficient.write(
+                '{projection_name}',
+                {{
+                    writeProperty: 'clustering_coef'
+                }}
+            )
+            YIELD nodePropertiesWritten, averageClusteringCoefficient
+            RETURN nodePropertiesWritten, averageClusteringCoefficient
+            """
+            result = session.run(cc_query).single()
+            print(f"    ✓ Clustering Coefficient: {result['nodePropertiesWritten']:,} nodes")
+            print(f"      Average: {result['averageClusteringCoefficient']:.4f}")
+    
+    def compute_temporal_features(self):
+        """Compute temporal features: connection velocity and burst patterns."""
+        print(f"\n--- Computing Temporal Features ---")
+        
+        with self.driver.session(database=self.database) as session:
+            query = """
+            MATCH (n:IP)
+            OPTIONAL MATCH (n)-[r:CONNECTS]->()
+            WITH n, r ORDER BY r.timestamp
+            WITH n, collect(r.timestamp) as timestamps
+            WHERE size(timestamps) > 1
+            
+            WITH n, timestamps,
+                 timestamps[-1] - timestamps[0] as time_span,
+                 size(timestamps) as total_connections
+            
+            WITH n,
+                 CASE WHEN time_span > 0 
+                      THEN toFloat(total_connections) / (time_span / 3600.0)
+                      ELSE 0.0 END as conn_velocity,
+                 total_connections,
+                 timestamps
+            
+            // Compute burst score (variance in inter-arrival times)
+            WITH n, conn_velocity, total_connections, timestamps,
+                 [i in range(0, size(timestamps)-2) | timestamps[i+1] - timestamps[i]] as intervals
+            
+            WITH n, conn_velocity, total_connections,
+                 CASE WHEN size(intervals) > 1
+                      THEN reduce(sum = 0.0, x IN intervals | sum + x) / size(intervals)
+                      ELSE 0.0 END as mean_interval,
+                 intervals
+            
+            WITH n, conn_velocity, total_connections, mean_interval, intervals,
+                 CASE WHEN size(intervals) > 1 AND mean_interval > 0
+                      THEN sqrt(reduce(sum = 0.0, x IN intervals | sum + (x - mean_interval)^2) / size(intervals)) / mean_interval
+                      ELSE 0.0 END as burst_score
+            
+            SET n.conn_velocity = conn_velocity,
+                n.burst_score = burst_score,
+                n.total_connections = total_connections
+            
+            RETURN count(n) as nodes_updated,
+                   avg(conn_velocity) as avg_velocity,
+                   avg(burst_score) as avg_burst
+            """
+            
+            result = session.run(query).single()
+            print(f"  ✓ Temporal features computed")
+            print(f"    Nodes updated: {result['nodes_updated']:,}")
+            print(f"    Avg connection velocity: {result['avg_velocity']:.2f} conn/hour")
+            print(f"    Avg burst score: {result['avg_burst']:.4f}")
+    
+    def identify_reconnaissance_victims_by_subnet(self, use_labels: bool, 
+                                                   historical_window_hours: int):
+        """Identify subnets that were victims of reconnaissance."""
+        print(f"\n--- Identifying Reconnaissance Victims by Subnet ---")
+        
+        with self.driver.session(database=self.database) as session:
+            if use_labels:
+                # Use MITRE ATT&CK labels
+                query = """
+                MATCH (a:IP)-[r:CONNECTS]->(v:IP)
+                WHERE r.is_attack = 1 AND r.tactic = 'Reconnaissance'
+                WITH DISTINCT v.subnet as victim_subnet, r.timestamp as recon_time
+                ORDER BY recon_time
+                RETURN victim_subnet, recon_time
+                """
+            else:
+                # Label-agnostic: any incoming connection followed by outgoing
+                query = """
+                MATCH (a:IP)-[r1:CONNECTS]->(v:IP)
+                WITH DISTINCT v.subnet as victim_subnet, r1.timestamp as recon_time
+                WHERE exists((v)-[:CONNECTS]->())
+                ORDER BY recon_time
+                RETURN victim_subnet, recon_time
+                LIMIT 10000  // Reasonable sample
+                """
+            
             result = session.run(query).data()
-            if result:
-                for record in result:
-                    print(f"Attack Detected: {record['attacker_ip']} -> {record['victim_ip']} "
-                          f"on port {record['port']} (Tactic: {record['tactic']})")
-            else:
-                print("No attack paths found.")
-
-    def visualize_attack_graph(self):
-        """Generates and saves a PNG visualization of the attack graph."""
-        print("\n--- GENERATING GRAPH VISUALIZATION ---")
-        query = "MATCH (a:IP)-[r:CONNECTS]->(v:IP) RETURN a.address AS source, v.address AS target, r.is_attack AS is_attack LIMIT 1000"
+            print(f"  ✓ Found {len(result):,} reconnaissance events on subnets")
+            
+            return result
+    
+    def check_subnet_pivot_behavior(self, subnet: str, recon_time: int, 
+                                   detection_window_hours: int, use_labels: bool):
+        """Check if ANY IP in the subnet launched attacks after reconnaissance."""
         
         with self.driver.session(database=self.database) as session:
-            results = session.run(query).data()
+            window_sec = detection_window_hours * 3600
+            
+            if use_labels:
+                query = """
+                MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
+                WHERE pivot.subnet = $subnet
+                  AND r.timestamp > $recon_time
+                  AND r.timestamp <= $recon_time + $window_sec
+                  AND r.is_attack = 1
+                RETURN count(r) > 0 as became_pivot,
+                       count(r) as attack_count,
+                       collect(DISTINCT pivot.address)[0..5] as pivot_ips
+                """
+            else:
+                # Label-agnostic: just check for outgoing connections
+                query = """
+                MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
+                WHERE pivot.subnet = $subnet
+                  AND r.timestamp > $recon_time
+                  AND r.timestamp <= $recon_time + $window_sec
+                RETURN count(r) > 0 as became_pivot,
+                       count(r) as attack_count,
+                       collect(DISTINCT pivot.address)[0..5] as pivot_ips
+                """
+            
+            result = session.run(query, subnet=subnet, recon_time=recon_time, 
+                               window_sec=window_sec).single()
+            
+            return {
+                'became_pivot': result['became_pivot'],
+                'attack_count': result['attack_count'],
+                'pivot_ips': result['pivot_ips']
+            }
+    
+    def get_subnet_features(self, subnet: str, recon_time: int, 
+                           historical_window_hours: int, use_labels: bool):
+        """Extract all features for a subnet (embedding + centrality + temporal)."""
         
-        if not results: 
-            print("No data to visualize.")
+        with self.driver.session(database=self.database) as session:
+            window_sec = historical_window_hours * 3600
+            embedding_prop = 'embedding_label_aware' if use_labels else 'embedding_label_agnostic'
+            
+            query = f"""
+            MATCH (n:IP)
+            WHERE n.subnet = $subnet
+            
+            // Get embeddings and centrality for IPs in subnet
+            WITH n,
+                 n.{embedding_prop} as embedding,
+                 coalesce(n.pagerank, 0.0) as pagerank,
+                 coalesce(n.betweenness, 0.0) as betweenness,
+                 coalesce(n.clustering_coef, 0.0) as clustering,
+                 coalesce(n.conn_velocity, 0.0) as velocity,
+                 coalesce(n.burst_score, 0.0) as burst
+            
+            // Aggregate subnet-level features
+            RETURN 
+                collect(embedding) as embeddings,
+                avg(pagerank) as avg_pagerank,
+                max(pagerank) as max_pagerank,
+                avg(betweenness) as avg_betweenness,
+                max(betweenness) as max_betweenness,
+                avg(clustering) as avg_clustering,
+                avg(velocity) as avg_velocity,
+                max(velocity) as max_velocity,
+                avg(burst) as avg_burst,
+                count(n) as subnet_size
+            """
+            
+            result = session.run(query, subnet=subnet, 
+                               recon_time=recon_time, 
+                               window_sec=window_sec).single()
+            
+            if not result or not result['embeddings']:
+                return None
+            
+            # Average embeddings across subnet IPs
+            embeddings = [emb for emb in result['embeddings'] if emb is not None]
+            if not embeddings:
+                return None
+            
+            avg_embedding = np.mean(embeddings, axis=0)
+            
+            return {
+                'embedding': avg_embedding,
+                'subnet_size': result['subnet_size'],
+                'avg_pagerank': float(result['avg_pagerank'] or 0),
+                'max_pagerank': float(result['max_pagerank'] or 0),
+                'avg_betweenness': float(result['avg_betweenness'] or 0),
+                'max_betweenness': float(result['max_betweenness'] or 0),
+                'avg_clustering': float(result['avg_clustering'] or 0),
+                'avg_velocity': float(result['avg_velocity'] or 0),
+                'max_velocity': float(result['max_velocity'] or 0),
+                'avg_burst': float(result['avg_burst'] or 0)
+            }
+    
+    def run_pivot_prediction(self, use_labels: bool, historical_window_hours: int,
+                            detection_window_hours: int, embedding_dim: int,
+                            output_prefix: str):
+        """Run the complete pivot prediction pipeline."""
+        
+        # Step 1: Create graph projection
+        projection_name = f"pivot_graph_{'labeled' if use_labels else 'unlabeled'}"
+        self.create_graph_projection(projection_name, use_labels)
+        
+        # Step 2: Compute FastRP embeddings
+        self.compute_fastrp_embeddings(projection_name, embedding_dim, use_labels)
+        
+        # Step 3: Compute centrality metrics
+        # For label-aware mode, use the structure projection
+        centrality_projection = f"{projection_name}_structure" if use_labels else projection_name
+        self.compute_centrality_metrics(centrality_projection)
+        
+        # Step 4: Compute temporal features
+        self.compute_temporal_features()
+        
+        # Step 5: Identify reconnaissance victims by subnet
+        recon_events = self.identify_reconnaissance_victims_by_subnet(
+            use_labels, historical_window_hours
+        )
+        
+        if not recon_events:
+            print("  ⚠ No reconnaissance events found")
             return
         
-        G = nx.DiGraph()
-        attack_edges = set()
-        attacker_nodes = set()
+        # Step 6: Train/test split (50/50 temporal)
+        split_idx = len(recon_events) // 2
+        train_events = recon_events[:split_idx]
+        test_events = recon_events[split_idx:]
         
-        for record in results:
-            G.add_edge(record['source'], record['target'])
-            if record['is_attack']:
-                attack_edges.add((record['source'], record['target']))
-                attacker_nodes.add(record['source'])
+        print(f"\n--- Train/Test Split ---")
+        print(f"  Training: {len(train_events):,} events")
+        print(f"  Testing: {len(test_events):,} events")
         
-        node_colors = ['red' if node in attacker_nodes else 'skyblue' for node in G.nodes()]
-        edge_colors = ['red' if edge in attack_edges else 'lightgray' for edge in G.edges()]
+        # Step 7: Process training set
+        print(f"\n--- Processing Training Set ---")
+        train_results = self.process_event_set(
+            train_events, use_labels, historical_window_hours, 
+            detection_window_hours, "Training"
+        )
         
-        plt.figure(figsize=(20, 16))
-        pos = nx.spring_layout(G, k=0.7, iterations=40)
-        nx.draw(G, pos, with_labels=True, node_color=node_colors, edge_color=edge_colors, 
-                node_size=1500, font_size=8, width=0.8, arrows=True)
-        plt.title("Network Graph with Attack Paths Highlighted (Red=Attackers)", size=20)
-        plt.savefig("network_attack_graph.png", dpi=150, bbox_inches='tight')
-        print("✓ Visualization saved to 'network_attack_graph.png'")
+        if not train_results:
+            print("  ⚠ No valid training data")
+            return
+        
+        train_df = pd.DataFrame(train_results)
+        train_pivot_count = train_df['became_pivot'].sum()
+        
+        print(f"\n  Training Results:")
+        print(f"    Valid samples: {len(train_df):,}")
+        print(f"    Pivots: {train_pivot_count:,} ({train_pivot_count/len(train_df)*100:.1f}%)")
+        
+        if train_pivot_count == 0:
+            print("  ⚠ No pivots in training set")
+            return
+        
+        # Create reference pivot embedding
+        train_pivot_embeddings = np.array([
+            r['embedding'] for r in train_results if r['became_pivot']
+        ])
+        reference_pivot_embedding = np.mean(train_pivot_embeddings, axis=0)
+        
+        # Step 8: Process test set
+        print(f"\n--- Processing Test Set ---")
+        test_results = self.process_event_set(
+            test_events, use_labels, historical_window_hours,
+            detection_window_hours, "Testing"
+        )
+        
+        if not test_results:
+            print("  ⚠ No valid test data")
+            return
+        
+        test_df = pd.DataFrame(test_results)
+        test_pivot_count = test_df['became_pivot'].sum()
+        
+        print(f"\n  Test Results:")
+        print(f"    Valid samples: {len(test_df):,}")
+        print(f"    Pivots: {test_pivot_count:,} ({test_pivot_count/len(test_df)*100:.1f}%)")
+        
+        # Step 9: Compute similarities and evaluate
+        test_df['fastrp_similarity'] = test_df['embedding'].apply(
+            lambda emb: cosine_similarity(
+                np.array(emb).reshape(1, -1),
+                reference_pivot_embedding.reshape(1, -1)
+            )[0][0]
+        )
+        
+        # Step 10: Statistical analysis
+        self.perform_statistical_analysis(test_df, output_prefix)
+        
+        # Step 11: Baseline comparison
+        self.compare_with_baselines(test_df, output_prefix)
+        
+        # Step 12: Multi-hop chain analysis
+        self.analyze_multi_hop_chains(use_labels, output_prefix)
+        
+        # Step 13: Save results and visualize
+        test_df.to_csv(f'{output_prefix}_pivot_predictions.csv', index=False)
+        self.visualize_results(test_df, output_prefix)
+        
+        # Cleanup projection
+        with self.driver.session(database=self.database) as session:
+            session.run(f"CALL gds.graph.drop('{projection_name}')")
+    
+    def process_event_set(self, events: List[Dict], use_labels: bool,
+                         historical_window_hours: int, detection_window_hours: int,
+                         set_name: str):
+        """Process a set of reconnaissance events (OPTIMIZED: batch processing)."""
+        
+        results = []
+        batch_size = 1000  # Process 1000 events per query
+        
+        with tqdm(total=len(events), desc=f"  Processing {set_name} events", 
+                 unit="subnet") as pbar:
+            
+            # Process in batches
+            for batch_start in range(0, len(events), batch_size):
+                batch_events = events[batch_start:batch_start + batch_size]
+                
+                # Get all features and pivot info in ONE query per batch
+                batch_results = self.process_event_batch(
+                    batch_events, use_labels, historical_window_hours, detection_window_hours
+                )
+                
+                results.extend(batch_results)
+                pbar.update(len(batch_events))
+        
+        return results
+    
+    def process_event_batch(self, events: List[Dict], use_labels: bool,
+                           historical_window_hours: int, detection_window_hours: int):
+        """Process a batch of events in a single query."""
+        
+        with self.driver.session(database=self.database) as session:
+            hist_window_sec = historical_window_hours * 3600
+            det_window_sec = detection_window_hours * 3600
+            embedding_prop = 'embedding_label_aware' if use_labels else 'embedding_label_agnostic'
+            
+            # Build pivot detection clause
+            pivot_clause = "AND r.is_attack = 1" if use_labels else ""
+            
+            query = f"""
+            UNWIND $events AS event
+            
+            // Get subnet features
+            MATCH (n:IP)
+            WHERE n.subnet = event.subnet
+            
+            WITH event, n,
+                 n.{embedding_prop} as embedding,
+                 coalesce(n.pagerank, 0.0) as pagerank,
+                 coalesce(n.betweenness, 0.0) as betweenness,
+                 coalesce(n.clustering_coef, 0.0) as clustering,
+                 coalesce(n.conn_velocity, 0.0) as velocity,
+                 coalesce(n.burst_score, 0.0) as burst
+            
+            WITH event,
+                 collect(embedding) as embeddings,
+                 avg(pagerank) as avg_pagerank,
+                 max(pagerank) as max_pagerank,
+                 avg(betweenness) as avg_betweenness,
+                 max(betweenness) as max_betweenness,
+                 avg(clustering) as avg_clustering,
+                 avg(velocity) as avg_velocity,
+                 max(velocity) as max_velocity,
+                 avg(burst) as avg_burst,
+                 count(n) as subnet_size
+            
+            // Check for pivot behavior
+            OPTIONAL MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
+            WHERE pivot.subnet = event.subnet
+              AND r.timestamp > event.recon_time
+              AND r.timestamp <= event.recon_time + $det_window_sec
+              {pivot_clause}
+            
+            WITH event, embeddings, avg_pagerank, max_pagerank, avg_betweenness,
+                 max_betweenness, avg_clustering, avg_velocity, max_velocity,
+                 avg_burst, subnet_size,
+                 count(r) as attack_count,
+                 collect(DISTINCT pivot.address)[0..5] as pivot_ips
+            
+            RETURN event.subnet as subnet,
+                   event.recon_time as recon_time,
+                   embeddings,
+                   attack_count > 0 as became_pivot,
+                   attack_count,
+                   pivot_ips,
+                   subnet_size,
+                   avg_pagerank,
+                   max_pagerank,
+                   avg_betweenness,
+                   max_betweenness,
+                   avg_clustering,
+                   avg_velocity,
+                   max_velocity,
+                   avg_burst
+            """
+            
+            # Prepare event data
+            event_data = [
+                {'subnet': e['victim_subnet'], 'recon_time': e['recon_time']}
+                for e in events
+            ]
+            
+            result = session.run(query, events=event_data, det_window_sec=det_window_sec)
+            
+            batch_results = []
+            for record in result:
+                # Filter out records with no embeddings
+                embeddings = [emb for emb in record['embeddings'] if emb is not None]
+                if not embeddings:
+                    continue
+                
+                # Average embeddings across subnet IPs
+                avg_embedding = np.mean(embeddings, axis=0)
+                
+                batch_results.append({
+                    'subnet': record['subnet'],
+                    'recon_time': record['recon_time'],
+                    'embedding': avg_embedding,
+                    'became_pivot': record['became_pivot'],
+                    'attack_count': record['attack_count'],
+                    'pivot_ips': record['pivot_ips'],
+                    'subnet_size': record['subnet_size'],
+                    'avg_pagerank': float(record['avg_pagerank'] or 0),
+                    'max_pagerank': float(record['max_pagerank'] or 0),
+                    'avg_betweenness': float(record['avg_betweenness'] or 0),
+                    'max_betweenness': float(record['max_betweenness'] or 0),
+                    'avg_clustering': float(record['avg_clustering'] or 0),
+                    'avg_velocity': float(record['avg_velocity'] or 0),
+                    'max_velocity': float(record['max_velocity'] or 0),
+                    'avg_burst': float(record['avg_burst'] or 0)
+                })
+            
+            return batch_results
+    
+    def perform_statistical_analysis(self, test_df: pd.DataFrame, output_prefix: str):
+        """Perform statistical significance testing."""
+        print(f"\n--- Statistical Analysis ---")
+        
+        pivot_sims = test_df[test_df['became_pivot']]['fastrp_similarity']
+        non_pivot_sims = test_df[~test_df['became_pivot']]['fastrp_similarity']
+        
+        print(f"\n  FastRP Similarity Statistics:")
+        print(f"    Pivots:     mean={pivot_sims.mean():.4f}, std={pivot_sims.std():.4f}")
+        print(f"    Non-pivots: mean={non_pivot_sims.mean():.4f}, std={non_pivot_sims.std():.4f}")
+        print(f"    Difference: {pivot_sims.mean() - non_pivot_sims.mean():.4f}")
+        
+        # Welch's t-test
+        t_stat, p_value = stats.ttest_ind(pivot_sims, non_pivot_sims, equal_var=False)
+        print(f"\n  Welch's t-test: t={t_stat:.4f}, p={p_value:.6f}")
+        
+        if p_value < 0.05:
+            print(f"  ✓ STATISTICALLY SIGNIFICANT (p < 0.05)")
+        else:
+            print(f"  ⚠ Not statistically significant")
+        
+        # Effect size (Cohen's d)
+        pooled_std = np.sqrt((pivot_sims.std()**2 + non_pivot_sims.std()**2) / 2)
+        cohens_d = (pivot_sims.mean() - non_pivot_sims.mean()) / pooled_std if pooled_std > 0 else 0
+        
+        print(f"  Cohen's d: {cohens_d:.4f}", end="")
+        if abs(cohens_d) < 0.2:
+            print(" (small effect)")
+        elif abs(cohens_d) < 0.5:
+            print(" (medium effect)")
+        else:
+            print(" (large effect)")
+        
+        # Mann-Whitney U test (non-parametric alternative)
+        u_stat, u_p_value = stats.mannwhitneyu(pivot_sims, non_pivot_sims, alternative='greater')
+        print(f"  Mann-Whitney U: U={u_stat:.0f}, p={u_p_value:.6f}")
+    
+    def compare_with_baselines(self, test_df: pd.DataFrame, output_prefix: str):
+        """Compare FastRP with baseline methods."""
+        print(f"\n--- Baseline Comparison ---")
+        
+        # Normalize features
+        for col in ['avg_pagerank', 'max_pagerank', 'avg_betweenness', 
+                   'max_betweenness', 'avg_clustering', 'avg_velocity', 
+                   'max_velocity', 'avg_burst', 'subnet_size']:
+            if test_df[col].std() > 0:
+                test_df[f'{col}_norm'] = (test_df[col] - test_df[col].mean()) / test_df[col].std()
+            else:
+                test_df[f'{col}_norm'] = 0
+        
+        methods = {
+            'FastRP Embedding': 'fastrp_similarity',
+            'Avg PageRank': 'avg_pagerank_norm',
+            'Max PageRank': 'max_pagerank_norm',
+            'Avg Betweenness': 'avg_betweenness_norm',
+            'Max Betweenness': 'max_betweenness_norm',
+            'Avg Clustering': 'avg_clustering_norm',
+            'Connection Velocity': 'avg_velocity_norm',
+            'Burst Score': 'avg_burst_norm',
+            'Subnet Size': 'subnet_size_norm'
+        }
+        
+        comparison_results = []
+        
+        for method_name, score_column in methods.items():
+            scores = test_df[score_column].fillna(0)
+            y_true = test_df['became_pivot'].astype(int)
+            
+            # ROC curve
+            fpr, tpr, thresholds = roc_curve(y_true, scores)
+            roc_auc = auc(fpr, tpr)
+            
+            # Precision-Recall curve
+            precision, recall, _ = precision_recall_curve(y_true, scores)
+            pr_auc = auc(recall, precision)
+            
+            # Find optimal threshold (maximize F1)
+            best_f1 = 0
+            best_metrics = {}
+            
+            for threshold in thresholds:
+                preds = (scores >= threshold).astype(int)
+                tp = ((preds == 1) & (y_true == 1)).sum()
+                fp = ((preds == 1) & (y_true == 0)).sum()
+                fn = ((preds == 0) & (y_true == 1)).sum()
+                tn = ((preds == 0) & (y_true == 0)).sum()
+                
+                accuracy = (tp + tn) / len(test_df) if len(test_df) > 0 else 0
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+                
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_metrics = {
+                        'accuracy': accuracy,
+                        'precision': prec,
+                        'recall': rec,
+                        'f1': f1
+                    }
+            
+            comparison_results.append({
+                'Method': method_name,
+                'AUC-ROC': roc_auc,
+                'AUC-PR': pr_auc,
+                'Accuracy': best_metrics['accuracy'],
+                'Precision': best_metrics['precision'],
+                'Recall': best_metrics['recall'],
+                'F1-Score': best_metrics['f1']
+            })
+        
+        comparison_df = pd.DataFrame(comparison_results)
+        print("\n" + "="*100)
+        print("METHOD COMPARISON")
+        print("="*100)
+        print(comparison_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+        print("="*100)
+        
+        # Save comparison
+        comparison_df.to_csv(f'{output_prefix}_method_comparison.csv', index=False)
+        
+        # Determine best method
+        best_method = comparison_df.loc[comparison_df['F1-Score'].idxmax()]
+        fastrp_f1 = comparison_df[comparison_df['Method'] == 'FastRP Embedding']['F1-Score'].values[0]
+        
+        print(f"\n  Best Method: {best_method['Method']} (F1={best_method['F1-Score']:.4f})")
+        
+        if best_method['Method'] == 'FastRP Embedding':
+            print(f"  ✓ FastRP outperforms all baselines")
+        else:
+            diff = (fastrp_f1 - best_method['F1-Score']) * 100
+            print(f"  ⚠ FastRP is {abs(diff):.2f}pp {'behind' if diff < 0 else 'ahead of'} best baseline")
+    
+    def analyze_multi_hop_chains(self, use_labels: bool, output_prefix: str):
+        """Analyze multi-hop attack chains (A→B→C→D)."""
+        print(f"\n--- Multi-Hop Attack Chain Analysis ---")
+        
+        with self.driver.session(database=self.database) as session:
+            if use_labels:
+                query = """
+                MATCH path = (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)-[r3:CONNECTS]->(d:IP)
+                WHERE r1.is_attack = 1 AND r2.is_attack = 1 AND r3.is_attack = 1
+                  AND r2.timestamp > r1.timestamp
+                  AND r3.timestamp > r2.timestamp
+                  AND a <> c AND b <> d AND a <> d
+                WITH 
+                    a.subnet as hop1_subnet,
+                    b.subnet as hop2_subnet,
+                    c.subnet as hop3_subnet,
+                    d.subnet as hop4_subnet,
+                    r1.timestamp as t1,
+                    r2.timestamp as t2,
+                    r3.timestamp as t3,
+                    r1.tactic as tactic1,
+                    r2.tactic as tactic2,
+                    r3.tactic as tactic3
+                LIMIT 100
+                RETURN 
+                    hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
+                    (t2 - t1) / 3600.0 as hours_to_hop2,
+                    (t3 - t2) / 3600.0 as hours_to_hop3,
+                    tactic1, tactic2, tactic3
+                """
+            else:
+                query = """
+                MATCH path = (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)-[r3:CONNECTS]->(d:IP)
+                WHERE r2.timestamp > r1.timestamp
+                  AND r3.timestamp > r2.timestamp
+                  AND a <> c AND b <> d AND a <> d
+                WITH 
+                    a.subnet as hop1_subnet,
+                    b.subnet as hop2_subnet,
+                    c.subnet as hop3_subnet,
+                    d.subnet as hop4_subnet,
+                    r1.timestamp as t1,
+                    r2.timestamp as t2,
+                    r3.timestamp as t3
+                LIMIT 100
+                RETURN 
+                    hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
+                    (t2 - t1) / 3600.0 as hours_to_hop2,
+                    (t3 - t2) / 3600.0 as hours_to_hop3
+                """
+            
+            result = session.run(query).data()
+            
+            if not result:
+                print("  ⚠ No multi-hop chains found")
+                return
+            
+            print(f"  ✓ Found {len(result):,} multi-hop attack chains")
+            
+            df = pd.DataFrame(result)
+            
+            print(f"\n  Chain Timing Statistics:")
+            print(f"    Mean time to 2nd hop: {df['hours_to_hop2'].mean():.2f} hours")
+            print(f"    Mean time to 3rd hop: {df['hours_to_hop3'].mean():.2f} hours")
+            print(f"    Median time to 2nd hop: {df['hours_to_hop2'].median():.2f} hours")
+            print(f"    Median time to 3rd hop: {df['hours_to_hop3'].median():.2f} hours")
+            
+            if use_labels and 'tactic1' in df.columns:
+                print(f"\n  Most Common Tactic Sequences:")
+                tactic_sequences = df.groupby(['tactic1', 'tactic2', 'tactic3']).size().sort_values(ascending=False).head(5)
+                for (t1, t2, t3), count in tactic_sequences.items():
+                    print(f"    {t1} → {t2} → {t3}: {count} chains")
+            
+            # Save chains
+            df.to_csv(f'{output_prefix}_multi_hop_chains.csv', index=False)
+    
+    def compare_analysis_modes(self):
+        """Compare label-aware vs label-agnostic analysis results."""
+        print("\n" + "="*80)
+        print("COMPARING LABEL-AWARE VS LABEL-AGNOSTIC ANALYSIS")
+        print("="*80)
+        
+        try:
+            # Load results from both modes
+            label_aware_df = pd.read_csv('label_aware_pivot_predictions.csv')
+            label_agnostic_df = pd.read_csv('label_agnostic_pivot_predictions.csv')
+            
+            label_aware_comp = pd.read_csv('label_aware_method_comparison.csv')
+            label_agnostic_comp = pd.read_csv('label_agnostic_method_comparison.csv')
+            
+            print("\n--- Performance Comparison ---")
+            print("\nLabel-Aware FastRP:")
+            la_fastrp = label_aware_comp[label_aware_comp['Method'] == 'FastRP Embedding'].iloc[0]
+            print(f"  AUC-ROC: {la_fastrp['AUC-ROC']:.4f}")
+            print(f"  AUC-PR:  {la_fastrp['AUC-PR']:.4f}")
+            print(f"  F1-Score: {la_fastrp['F1-Score']:.4f}")
+            print(f"  Precision: {la_fastrp['Precision']:.4f}")
+            print(f"  Recall: {la_fastrp['Recall']:.4f}")
+            
+            print("\nLabel-Agnostic FastRP:")
+            lag_fastrp = label_agnostic_comp[label_agnostic_comp['Method'] == 'FastRP Embedding'].iloc[0]
+            print(f"  AUC-ROC: {lag_fastrp['AUC-ROC']:.4f}")
+            print(f"  AUC-PR:  {lag_fastrp['AUC-PR']:.4f}")
+            print(f"  F1-Score: {lag_fastrp['F1-Score']:.4f}")
+            print(f"  Precision: {lag_fastrp['Precision']:.4f}")
+            print(f"  Recall: {lag_fastrp['Recall']:.4f}")
+            
+            # Compute differences
+            print("\n--- Performance Differences (Label-Aware minus Label-Agnostic) ---")
+            print(f"  ΔAUC-ROC: {(la_fastrp['AUC-ROC'] - lag_fastrp['AUC-ROC']):.4f}")
+            print(f"  ΔAUC-PR:  {(la_fastrp['AUC-PR'] - lag_fastrp['AUC-PR']):.4f}")
+            print(f"  ΔF1-Score: {(la_fastrp['F1-Score'] - lag_fastrp['F1-Score']):.4f}")
+            
+            # Determine which is better
+            if la_fastrp['F1-Score'] > lag_fastrp['F1-Score']:
+                improvement = ((la_fastrp['F1-Score'] - lag_fastrp['F1-Score']) / lag_fastrp['F1-Score']) * 100
+                print(f"\n✓ Label-aware analysis performs {improvement:.1f}% better")
+                print("  Conclusion: MITRE ATT&CK labels enhance pivot prediction")
+            elif lag_fastrp['F1-Score'] > la_fastrp['F1-Score']:
+                improvement = ((lag_fastrp['F1-Score'] - la_fastrp['F1-Score']) / la_fastrp['F1-Score']) * 100
+                print(f"\n✓ Label-agnostic analysis performs {improvement:.1f}% better")
+                print("  Conclusion: Structural features alone are sufficient for pivot prediction")
+            else:
+                print("\n  Both approaches perform equally")
+            
+            # Create comparison visualization
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Plot 1: F1-Score comparison across all methods
+            ax = axes[0]
+            methods = label_aware_comp['Method'].values
+            la_f1 = label_aware_comp['F1-Score'].values
+            lag_f1 = label_agnostic_comp['F1-Score'].values
+            
+            x = np.arange(len(methods))
+            width = 0.35
+            
+            ax.bar(x - width/2, la_f1, width, label='Label-Aware', color='steelblue')
+            ax.bar(x + width/2, lag_f1, width, label='Label-Agnostic', color='coral')
+            
+            ax.set_ylabel('F1-Score')
+            ax.set_title('Method Comparison: Label-Aware vs Label-Agnostic')
+            ax.set_xticks(x)
+            ax.set_xticklabels(methods, rotation=45, ha='right')
+            ax.legend()
+            ax.grid(alpha=0.3, axis='y')
+            
+            # Plot 2: Similarity score distributions
+            ax = axes[1]
+            ax.hist(label_aware_df['fastrp_similarity'], bins=30, alpha=0.5,
+                   label='Label-Aware', color='steelblue', edgecolor='black')
+            ax.hist(label_agnostic_df['fastrp_similarity'], bins=30, alpha=0.5,
+                   label='Label-Agnostic', color='coral', edgecolor='black')
+            ax.set_xlabel('FastRP Similarity Score')
+            ax.set_ylabel('Frequency')
+            ax.set_title('Similarity Score Distribution Comparison')
+            ax.legend()
+            ax.grid(alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig('mode_comparison.png', dpi=150, bbox_inches='tight')
+            print("\n✓ Saved comparison visualization to 'mode_comparison.png'")
+            
+        except FileNotFoundError as e:
+            print(f"  ⚠ Could not load results files: {e}")
+            print("  Run both analysis modes first before comparing")
+    
+    def visualize_results(self, test_df: pd.DataFrame, output_prefix: str):
+        """Generate comprehensive visualizations."""
+        print(f"\n--- Generating Visualizations ---")
+        
+        fig, axes = plt.subplots(3, 3, figsize=(20, 18))
+        
+        pivot_df = test_df[test_df['became_pivot']]
+        non_pivot_df = test_df[~test_df['became_pivot']]
+        
+        # Plot 1: FastRP similarity distribution
+        ax = axes[0, 0]
+        ax.hist(non_pivot_df['fastrp_similarity'], bins=30, alpha=0.5, 
+               label='Non-Pivots', color='blue', edgecolor='black')
+        ax.hist(pivot_df['fastrp_similarity'], bins=30, alpha=0.5, 
+               label='Pivots', color='red', edgecolor='black')
+        ax.axvline(pivot_df['fastrp_similarity'].mean(), color='red', 
+                  linestyle='--', label=f'Pivot Mean: {pivot_df["fastrp_similarity"].mean():.3f}')
+        ax.axvline(non_pivot_df['fastrp_similarity'].mean(), color='blue', 
+                  linestyle='--', label=f'Non-Pivot Mean: {non_pivot_df["fastrp_similarity"].mean():.3f}')
+        ax.set_xlabel('FastRP Similarity to Reference Pivot')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Distribution of FastRP Similarity Scores')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        
+        # Plot 2: ROC Curve
+        ax = axes[0, 1]
+        y_true = test_df['became_pivot'].astype(int)
+        fpr, tpr, _ = roc_curve(y_true, test_df['fastrp_similarity'])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, lw=2, label=f'FastRP (AUC={roc_auc:.3f})', color='red')
+        ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Random')

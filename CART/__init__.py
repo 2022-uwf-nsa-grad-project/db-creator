@@ -8,17 +8,20 @@ A comprehensive toolkit for building and analyzing network graphs for threat int
 # `from CART.analyzers import ThesisAnalyzer`.
 
 from .base import Neo4jConnection
-from .analyzers import ThesisAnalyzer, KillChainAnalyzer, StructuralPivotAnalyzer
+from .analyzers import TemporalWindowAnalyzer, SubnetPivotAnalyzer
 from .reporting import ReportGenerator
-from .controller import AnalysisController
+from .controller import Controller
+
+# Backwards-compatible alias: some notebooks and examples used AnalysisController
+# previously. Keep the alias to avoid breaking existing code.
+AnalysisController = Controller
 
 # The __all__ variable explicitly defines the public API of the package.
 # It specifies which names are imported when a user does `from CART import *`.
 __all__ = [
     'Neo4jConnection',
-    'ThesisAnalyzer',
-    'KillChainAnalyzer',
-    'StructuralPivotAnalyzer',
+    'TemporalWindowAnalyzer',
+    'SubnetPivotAnalyzer',
     'ReportGenerator',
-    'AnalysisController'
+    'Controller'
 ]
