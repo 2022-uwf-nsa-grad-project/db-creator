@@ -1,0 +1,22 @@
+2025-10-30 15:23:46 - ThesisRunner - INFO - Initializing SubnetPivotAnalyzer...
+2025-10-30 15:23:46 - ThesisRunner - INFO - ThesisRunner initialized
+2025-10-30 15:23:46 - ThesisRunner - INFO - Results directory: /Users/treverknie/Desktop/UWF-Repos/db-creator/thesis_results
+2025-10-30 15:23:46 - ThesisRunner - INFO - Figures directory: /Users/treverknie/Desktop/UWF-Repos/db-creator/thesis_figures
+2025-10-30 15:23:46 - ThesisRunner - INFO - ================================================================================
+2025-10-30 15:23:46 - ThesisRunner - INFO - EXPLORING DATABASE
+2025-10-30 15:23:46 - ThesisRunner - INFO - ================================================================================
+2025-10-30 15:28:44 - ThesisRunner - INFO - ✓ Database exploration saved to thesis_results/database_exploration.json
+2025-10-30 15:28:44 - ThesisRunner - INFO -   - Nodes: N/A
+2025-10-30 15:28:44 - ThesisRunner - INFO -   - Relationships: N/A
+2025-10-30 15:28:44 - ThesisRunner - INFO -   - Subnets: 0
+2025-10-30 15:28:44 - ThesisRunner - INFO - ✓ Database exploration completed in 297.9s
+2025-10-30 15:28:45 - ThesisRunner - INFO - ================================================================================
+2025-10-30 15:28:45 - ThesisRunner - INFO - ANALYZING ATTACK TACTICS
+2025-10-30 15:28:45 - ThesisRunner - INFO - ================================================================================
+2025-10-30 15:28:46 - ThesisRunner - INFO - Analyzing overall tactic distribution...
+2025-10-30 15:28:46 - ThesisRunner - INFO - Analyzing cross-subnet attacks...
+2025-10-30 15:28:46 - ThesisRunner - INFO - Analyzing techniques by tactic...
+2025-10-30 15:28:46 - ThesisRunner - INFO - Comparing same-subnet vs cross-subnet attacks...
+2025-10-30 15:28:46 - ThesisRunner - INFO - Analyzing reconnaissance follow-up actions...
+2025-10-30 15:28:46 - ThesisRunner - INFO - ✓ Tactics analysis saved to thesis_results/attack_tactics_analysis.json
+2025-10-30 15:28:46 - ThesisRunner - INFO - ✓ Tactics analysis completed in 0.8s

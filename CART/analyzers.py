@@ -429,6 +429,246 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             return
         return super().close()
     
+    def explore_database(self, output_file="database_exploration.json"):
+        """Comprehensive database exploration to understand attack patterns."""
+        
+        try:
+            if not self.connect():
+                print("Failed to connect to database")
+                return
+            
+            print("\n" + "="*80)
+            print("DATABASE EXPLORATION & ATTACK PATTERN ANALYSIS")
+            print("="*80)
+            
+            exploration = {}
+            
+            with self.driver.session(database=self.database) as session:
+                
+                # 1. Basic Statistics
+                print("\n--- Basic Database Statistics ---")
+                stats_query = """
+                MATCH (n:IP)
+                OPTIONAL MATCH (n)-[r:CONNECTS]->()
+                WITH count(DISTINCT n) as total_ips,
+                     count(r) as total_connections,
+                     count(DISTINCT n.subnet) as total_subnets
+                RETURN total_ips, total_connections, total_subnets
+                """
+                stats = session.run(stats_query).single()
+                exploration['basic_stats'] = {
+                    'total_ips': stats['total_ips'],
+                    'total_connections': stats['total_connections'],
+                    'total_subnets': stats['total_subnets']
+                }
+                print(f"  Total IPs: {stats['total_ips']:,}")
+                print(f"  Total Connections: {stats['total_connections']:,}")
+                print(f"  Total Subnets: {stats['total_subnets']}")
+                
+                # 2. Attack Label Distribution
+                print("\n--- Attack Label Distribution ---")
+                label_query = """
+                MATCH ()-[r:CONNECTS]->()
+                WITH r.is_attack as is_attack,
+                     r.tactic as tactic,
+                     r.technique as technique
+                RETURN is_attack,
+                       count(*) as count,
+                       collect(DISTINCT tactic)[0..10] as sample_tactics,
+                       collect(DISTINCT technique)[0..10] as sample_techniques
+                ORDER BY is_attack
+                """
+                label_results = session.run(label_query).data()
+                exploration['attack_distribution'] = label_results
+                
+                for record in label_results:
+                    is_attack = "ATTACK" if record['is_attack'] == 1 else "BENIGN"
+                    print(f"\n  {is_attack}: {record['count']:,} connections")
+                    if record['is_attack'] == 1:
+                        print(f"    Sample Tactics: {', '.join([str(t) for t in record['sample_tactics'] if t])}")
+                        print(f"    Sample Techniques: {', '.join([str(t) for t in record['sample_techniques'] if t])}")
+                
+                # 3. Reconnaissance Pattern Analysis
+                print("\n--- Reconnaissance Attack Patterns ---")
+                recon_query = """
+                MATCH (attacker:IP)-[r:CONNECTS]->(victim:IP)
+                WHERE r.is_attack = 1 AND r.tactic = 'Reconnaissance'
+                WITH attacker, victim, r
+                ORDER BY r.timestamp
+                WITH attacker.subnet as attacker_subnet,
+                     victim.subnet as victim_subnet,
+                     count(r) as recon_count,
+                     min(r.timestamp) as first_recon,
+                     max(r.timestamp) as last_recon,
+                     collect(DISTINCT attacker.address)[0..3] as sample_attackers,
+                     collect(DISTINCT victim.address)[0..3] as sample_victims
+                RETURN attacker_subnet, victim_subnet, recon_count,
+                       first_recon, last_recon, sample_attackers, sample_victims
+                ORDER BY recon_count DESC
+                LIMIT 20
+                """
+                recon_results = session.run(recon_query).data()
+                exploration['reconnaissance_patterns'] = recon_results
+                
+                print(f"  Found {len(recon_results)} subnet-to-subnet reconnaissance patterns")
+                print("\n  Top Reconnaissance Patterns:")
+                for i, rec in enumerate(recon_results[:5], 1):
+                    print(f"    {i}. {rec['attacker_subnet']} → {rec['victim_subnet']}: {rec['recon_count']} scans")
+                
+                # 4. Lateral Movement Analysis
+                print("\n--- Lateral Movement Attack Patterns ---")
+                lateral_query = """
+                MATCH (attacker:IP)-[r:CONNECTS]->(victim:IP)
+                WHERE r.is_attack = 1 
+                  AND r.tactic IN ['Lateral Movement', 'Execution', 'Command and Control']
+                WITH attacker.subnet as attacker_subnet,
+                     victim.subnet as victim_subnet,
+                     r.tactic as tactic,
+                     count(r) as attack_count,
+                     collect(DISTINCT r.technique)[0..5] as techniques
+                RETURN attacker_subnet, victim_subnet, tactic, attack_count, techniques
+                ORDER BY attack_count DESC
+                LIMIT 20
+                """
+                lateral_results = session.run(lateral_query).data()
+                exploration['lateral_movement_patterns'] = lateral_results
+                
+                print(f"  Found {len(lateral_results)} lateral movement patterns")
+                print("\n  Top Lateral Movement Patterns:")
+                for i, lat in enumerate(lateral_results[:5], 1):
+                    print(f"    {i}. {lat['attacker_subnet']} → {lat['victim_subnet']}")
+                    print(f"       Tactic: {lat['tactic']}, Count: {lat['attack_count']}")
+                    print(f"       Techniques: {', '.join([str(t) for t in lat['techniques'] if t])}")
+                
+                # 5. Attack Chain Analysis (Recon → Pivot)
+                print("\n--- Attack Chain Analysis (Reconnaissance → Lateral Movement) ---")
+                chain_query = """
+                MATCH (a:IP)-[r1:CONNECTS]->(v:IP)
+                WHERE r1.is_attack = 1 AND r1.tactic = 'Reconnaissance'
+                
+                WITH v.subnet as victim_subnet, 
+                     r1.timestamp as recon_time,
+                     a.subnet as attacker_subnet
+                ORDER BY recon_time
+                LIMIT 1000
+                
+                MATCH (pivot:IP)-[r2:CONNECTS]->(target:IP)
+                WHERE pivot.subnet = victim_subnet
+                  AND r2.is_attack = 1
+                  AND r2.timestamp > recon_time
+                  AND r2.timestamp <= recon_time + 86400  // Within 24 hours
+                  AND r2.tactic IN ['Lateral Movement', 'Execution', 'Command and Control', 'Credential Access']
+                  AND target.subnet <> victim_subnet  // Cross-subnet attack
+                
+                WITH victim_subnet, 
+                     attacker_subnet,
+                     count(DISTINCT r2) as pivot_attacks,
+                     collect(DISTINCT r2.tactic)[0..5] as pivot_tactics,
+                     collect(DISTINCT target.subnet)[0..5] as target_subnets,
+                     min(recon_time) as first_recon,
+                     min(r2.timestamp) as first_pivot,
+                     (min(r2.timestamp) - min(recon_time)) as time_to_pivot
+                
+                RETURN victim_subnet,
+                       attacker_subnet,
+                       pivot_attacks,
+                       pivot_tactics,
+                       target_subnets,
+                       first_recon,
+                       first_pivot,
+                       time_to_pivot / 3600.0 as hours_to_pivot
+                ORDER BY pivot_attacks DESC
+                LIMIT 50
+                """
+                chain_results = session.run(chain_query).data()
+                exploration['attack_chains'] = chain_results
+                
+                print(f"  Found {len(chain_results)} true attack chains (Recon → Pivot)")
+                if chain_results:
+                    print("\n  Sample Attack Chains:")
+                    for i, chain in enumerate(chain_results[:10], 1):
+                        print(f"    {i}. {chain['attacker_subnet']} scans → {chain['victim_subnet']} pivots → {chain['target_subnets']}")
+                        print(f"       Time to pivot: {chain['hours_to_pivot']:.1f} hours, Pivot attacks: {chain['pivot_attacks']}")
+                        print(f"       Pivot tactics: {', '.join([str(t) for t in chain['pivot_tactics'] if t])}")
+                else:
+                    print("  ⚠ WARNING: No true attack chains found!")
+                    print("    This explains why pivot detection is finding everything as pivots.")
+                
+                # 6. Cross-Subnet Traffic Analysis
+                print("\n--- Cross-Subnet Traffic Patterns ---")
+                cross_subnet_query = """
+                MATCH (src:IP)-[r:CONNECTS]->(dst:IP)
+                WHERE src.subnet <> dst.subnet
+                WITH src.subnet as src_subnet,
+                     dst.subnet as dst_subnet,
+                     sum(CASE WHEN r.is_attack = 1 THEN 1 ELSE 0 END) as attack_count,
+                     sum(CASE WHEN r.is_attack = 0 THEN 1 ELSE 0 END) as benign_count,
+                     count(r) as total_count
+                RETURN src_subnet, dst_subnet, attack_count, benign_count, total_count
+                ORDER BY total_count DESC
+                LIMIT 20
+                """
+                cross_subnet_results = session.run(cross_subnet_query).data()
+                exploration['cross_subnet_patterns'] = cross_subnet_results
+                
+                print(f"  Top Cross-Subnet Communications:")
+                for i, cs in enumerate(cross_subnet_results[:5], 1):
+                    attack_pct = (cs['attack_count'] / cs['total_count'] * 100) if cs['total_count'] > 0 else 0
+                    print(f"    {i}. {cs['src_subnet']} → {cs['dst_subnet']}: {cs['total_count']:,} connections")
+                    print(f"       Attacks: {cs['attack_count']:,} ({attack_pct:.1f}%), Benign: {cs['benign_count']:,}")
+                
+                # 7. Temporal Analysis
+                print("\n--- Temporal Attack Distribution ---")
+                temporal_query = """
+                MATCH ()-[r:CONNECTS]->()
+                WHERE r.is_attack = 1
+                WITH r.timestamp / 3600 as hour_bucket
+                RETURN min(hour_bucket * 3600) as time_period,
+                       count(*) as attack_count
+                ORDER BY time_period
+                LIMIT 100
+                """
+                temporal_results = session.run(temporal_query).data()
+                exploration['temporal_distribution'] = temporal_results
+                
+                if temporal_results:
+                    print(f"  Attack activity spans {len(temporal_results)} time buckets")
+                    print(f"  First attacks: timestamp {temporal_results[0]['time_period']}")
+                    print(f"  Latest attacks: timestamp {temporal_results[-1]['time_period']}")
+                    print(f"  Peak hour: {max(temporal_results, key=lambda x: x['attack_count'])['attack_count']} attacks")
+            
+            # Save to JSON
+            with open(output_file, 'w') as f:
+                json.dump(exploration, f, indent=2, default=str)
+            
+            print(f"\n✓ Exploration results saved to {output_file}")
+            
+            # Generate recommendations
+            print("\n" + "="*80)
+            print("RECOMMENDATIONS FOR PIVOT DETECTION")
+            print("="*80)
+            
+            true_chains = len(exploration.get('attack_chains', []))
+            if true_chains == 0:
+                print("\n⚠ CRITICAL: No true attack chains found in the data!")
+                print("   Your dataset may not contain actual pivot behavior.")
+                print("   Consider:")
+                print("   1. Check if lateral movement attacks exist in your data")
+                print("   2. Verify MITRE ATT&CK labels are correct")
+                print("   3. Look for cross-subnet attacks after reconnaissance")
+            elif true_chains < 100:
+                print(f"\n⚠ WARNING: Only {true_chains} true attack chains found")
+                print("   This is a small number for training. Consider:")
+                print("   1. Expanding the time window (currently 24 hours)")
+                print("   2. Including more attack tactics as 'pivots'")
+            else:
+                print(f"\n✓ Found {true_chains} attack chains - good for analysis!")
+            
+            return exploration
+            
+        finally:
+            self.close()
+    
     @staticmethod
     def ip_to_subnet(ip_address: str, prefix_len: int = 24) -> str:
         """Convert IP address to subnet notation (e.g., '192.168.1.0/24')."""
@@ -942,8 +1182,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 # Label-agnostic: any incoming connection followed by outgoing
                 query = """
                 MATCH (a:IP)-[r1:CONNECTS]->(v:IP)
+                WHERE exists { (v)-[:CONNECTS]->() }
                 WITH DISTINCT v.subnet as victim_subnet, r1.timestamp as recon_time
-                WHERE exists((v)-[:CONNECTS]->())
                 ORDER BY recon_time
                 RETURN victim_subnet, recon_time
                 LIMIT 10000  // Reasonable sample
@@ -1167,122 +1407,105 @@ class SubnetPivotAnalyzer(Neo4jConnection):
     def process_event_set(self, events: List[Dict], use_labels: bool,
                          historical_window_hours: int, detection_window_hours: int,
                          set_name: str):
-        """Process a set of reconnaissance events (OPTIMIZED: batch processing)."""
+        """Process a set of reconnaissance events (SUPER OPTIMIZED: pre-fetch all data)."""
         
+        print(f"  Pre-fetching all subnet features and pivot data...")
+        
+        # Step 1: Get ALL subnet features in ONE query
+        subnet_features = self.get_all_subnet_features(use_labels)
+        
+        # Step 2: Get ALL pivot behaviors in ONE query
+        pivot_behaviors = self.get_all_pivot_behaviors(
+            events, use_labels, detection_window_hours
+        )
+        
+        # Step 3: Process in Python (fast!)
         results = []
-        batch_size = 1000  # Process 1000 events per query
         
+        print(f"  Processing {len(events)} events in memory...")
         with tqdm(total=len(events), desc=f"  Processing {set_name} events", 
                  unit="subnet") as pbar:
             
-            # Process in batches
-            for batch_start in range(0, len(events), batch_size):
-                batch_events = events[batch_start:batch_start + batch_size]
+            for event in events:
+                subnet = event['victim_subnet']
+                recon_time = event['recon_time']
                 
-                # Get all features and pivot info in ONE query per batch
-                batch_results = self.process_event_batch(
-                    batch_events, use_labels, historical_window_hours, detection_window_hours
-                )
+                # Get features from pre-fetched data
+                features = subnet_features.get(subnet)
+                if not features or not features['embeddings']:
+                    pbar.update(1)
+                    continue
                 
-                results.extend(batch_results)
-                pbar.update(len(batch_events))
+                # Get pivot info from pre-fetched data
+                pivot_key = (subnet, recon_time)
+                pivot_info = pivot_behaviors.get(pivot_key, {
+                    'became_pivot': False,
+                    'attack_count': 0,
+                    'pivot_ips': []
+                })
+                
+                # Average embeddings
+                avg_embedding = np.mean(features['embeddings'], axis=0)
+                
+                results.append({
+                    'subnet': subnet,
+                    'recon_time': recon_time,
+                    'embedding': avg_embedding,
+                    'became_pivot': pivot_info['became_pivot'],
+                    'attack_count': pivot_info['attack_count'],
+                    'pivot_ips': pivot_info['pivot_ips'],
+                    'subnet_size': features['subnet_size'],
+                    'avg_pagerank': features['avg_pagerank'],
+                    'max_pagerank': features['max_pagerank'],
+                    'avg_betweenness': features['avg_betweenness'],
+                    'max_betweenness': features['max_betweenness'],
+                    'avg_clustering': features['avg_clustering'],
+                    'avg_velocity': features['avg_velocity'],
+                    'max_velocity': features['max_velocity'],
+                    'avg_burst': features['avg_burst']
+                })
+                
+                pbar.update(1)
         
         return results
     
-    def process_event_batch(self, events: List[Dict], use_labels: bool,
-                           historical_window_hours: int, detection_window_hours: int):
-        """Process a batch of events in a single query."""
+    def get_all_subnet_features(self, use_labels: bool):
+        """Pre-fetch ALL subnet features in a single query."""
         
         with self.driver.session(database=self.database) as session:
-            hist_window_sec = historical_window_hours * 3600
-            det_window_sec = detection_window_hours * 3600
             embedding_prop = 'embedding_label_aware' if use_labels else 'embedding_label_agnostic'
             
-            # Build pivot detection clause
-            pivot_clause = "AND r.is_attack = 1" if use_labels else ""
-            
             query = f"""
-            UNWIND $events AS event
-            
-            // Get subnet features
             MATCH (n:IP)
-            WHERE n.subnet = event.subnet
+            WHERE n.subnet IS NOT NULL
             
-            WITH event, n,
-                 n.{embedding_prop} as embedding,
-                 coalesce(n.pagerank, 0.0) as pagerank,
-                 coalesce(n.betweenness, 0.0) as betweenness,
-                 coalesce(n.clustering_coef, 0.0) as clustering,
-                 coalesce(n.conn_velocity, 0.0) as velocity,
-                 coalesce(n.burst_score, 0.0) as burst
-            
-            WITH event,
-                 collect(embedding) as embeddings,
-                 avg(pagerank) as avg_pagerank,
-                 max(pagerank) as max_pagerank,
-                 avg(betweenness) as avg_betweenness,
-                 max(betweenness) as max_betweenness,
-                 avg(clustering) as avg_clustering,
-                 avg(velocity) as avg_velocity,
-                 max(velocity) as max_velocity,
-                 avg(burst) as avg_burst,
+            WITH n.subnet as subnet,
+                 collect(n.{embedding_prop}) as embeddings,
+                 avg(coalesce(n.pagerank, 0.0)) as avg_pagerank,
+                 max(coalesce(n.pagerank, 0.0)) as max_pagerank,
+                 avg(coalesce(n.betweenness, 0.0)) as avg_betweenness,
+                 max(coalesce(n.betweenness, 0.0)) as max_betweenness,
+                 avg(coalesce(n.clustering_coef, 0.0)) as avg_clustering,
+                 avg(coalesce(n.conn_velocity, 0.0)) as avg_velocity,
+                 max(coalesce(n.conn_velocity, 0.0)) as max_velocity,
+                 avg(coalesce(n.burst_score, 0.0)) as avg_burst,
                  count(n) as subnet_size
             
-            // Check for pivot behavior
-            OPTIONAL MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
-            WHERE pivot.subnet = event.subnet
-              AND r.timestamp > event.recon_time
-              AND r.timestamp <= event.recon_time + $det_window_sec
-              {pivot_clause}
-            
-            WITH event, embeddings, avg_pagerank, max_pagerank, avg_betweenness,
-                 max_betweenness, avg_clustering, avg_velocity, max_velocity,
-                 avg_burst, subnet_size,
-                 count(r) as attack_count,
-                 collect(DISTINCT pivot.address)[0..5] as pivot_ips
-            
-            RETURN event.subnet as subnet,
-                   event.recon_time as recon_time,
-                   embeddings,
-                   attack_count > 0 as became_pivot,
-                   attack_count,
-                   pivot_ips,
-                   subnet_size,
-                   avg_pagerank,
-                   max_pagerank,
-                   avg_betweenness,
-                   max_betweenness,
-                   avg_clustering,
-                   avg_velocity,
-                   max_velocity,
-                   avg_burst
+            RETURN subnet, embeddings, subnet_size,
+                   avg_pagerank, max_pagerank, avg_betweenness, max_betweenness,
+                   avg_clustering, avg_velocity, max_velocity, avg_burst
             """
             
-            # Prepare event data
-            event_data = [
-                {'subnet': e['victim_subnet'], 'recon_time': e['recon_time']}
-                for e in events
-            ]
+            result = session.run(query).data()
             
-            result = session.run(query, events=event_data, det_window_sec=det_window_sec)
-            
-            batch_results = []
+            # Build lookup dictionary
+            features_map = {}
             for record in result:
-                # Filter out records with no embeddings
+                # Filter out None embeddings
                 embeddings = [emb for emb in record['embeddings'] if emb is not None]
-                if not embeddings:
-                    continue
                 
-                # Average embeddings across subnet IPs
-                avg_embedding = np.mean(embeddings, axis=0)
-                
-                batch_results.append({
-                    'subnet': record['subnet'],
-                    'recon_time': record['recon_time'],
-                    'embedding': avg_embedding,
-                    'became_pivot': record['became_pivot'],
-                    'attack_count': record['attack_count'],
-                    'pivot_ips': record['pivot_ips'],
+                features_map[record['subnet']] = {
+                    'embeddings': embeddings,
                     'subnet_size': record['subnet_size'],
                     'avg_pagerank': float(record['avg_pagerank'] or 0),
                     'max_pagerank': float(record['max_pagerank'] or 0),
@@ -1292,9 +1515,135 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     'avg_velocity': float(record['avg_velocity'] or 0),
                     'max_velocity': float(record['max_velocity'] or 0),
                     'avg_burst': float(record['avg_burst'] or 0)
+                }
+            
+            print(f"    ✓ Loaded features for {len(features_map)} subnets")
+            return features_map
+    
+    def get_all_pivot_behaviors(self, events: List[Dict], use_labels: bool, 
+                               detection_window_hours: int):
+        """Pre-fetch ALL pivot behaviors - FIXED to detect true lateral movement."""
+        
+        with self.driver.session(database=self.database) as session:
+            det_window_sec = detection_window_hours * 3600
+            
+            # Get unique subnets from events and time range
+            subnets_in_events = set(e['victim_subnet'] for e in events)
+            min_time = min(e['recon_time'] for e in events)
+            max_time = max(e['recon_time'] for e in events) + det_window_sec
+            
+            print(f"    Fetching LATERAL MOVEMENT attacks for {len(subnets_in_events)} unique subnets...")
+            print(f"    Time range: {min_time} to {max_time} ({(max_time - min_time) / 3600:.1f} hours)")
+            
+            # Get ONLY lateral movement attacks (cross-subnet, post-recon)
+            # OPTIMIZATION: Filter by time range in Cypher to reduce data transfer
+            if use_labels:
+                # Label-aware: Use MITRE ATT&CK tactics that indicate lateral movement
+                # Based on exploration: dataset uses Credential Access, Defense Evasion, Exfiltration
+                query = """
+                MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
+                WHERE pivot.subnet IN $subnets
+                  AND r.is_attack = 1
+                  AND r.tactic IN ['Lateral Movement', 'Execution', 'Command and Control', 
+                                   'Credential Access', 'Defense Evasion', 'Exfiltration', 
+                                   'Collection', 'Discovery']
+                  AND target.subnet <> pivot.subnet  // Must be cross-subnet
+                  AND r.timestamp >= $min_time      // Filter by time range
+                  AND r.timestamp <= $max_time
+                RETURN pivot.subnet as pivot_subnet,
+                       target.subnet as target_subnet,
+                       r.timestamp as timestamp,
+                       pivot.address as pivot_ip,
+                       r.tactic as tactic,
+                       r.technique as technique
+                ORDER BY pivot.subnet, r.timestamp
+                """
+            else:
+                # Label-agnostic: Cross-subnet connections with burst behavior
+                # (multiple connections to new subnets in short time)
+                query = """
+                MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
+                WHERE pivot.subnet IN $subnets
+                  AND target.subnet <> pivot.subnet  // Must be cross-subnet
+                  AND r.timestamp >= $min_time      // Filter by time range
+                  AND r.timestamp <= $max_time
+                WITH pivot, target, r
+                ORDER BY r.timestamp
+                WITH pivot.subnet as pivot_subnet,
+                     target.subnet as target_subnet,
+                     collect(r.timestamp) as timestamps,
+                     collect(pivot.address) as pivot_ips,
+                     count(r) as connection_count
+                WHERE connection_count >= 3  // At least 3 connections = suspicious
+                  AND (timestamps[-1] - timestamps[0]) <= 3600  // Within 1 hour = burst
+                UNWIND range(0, size(timestamps)-1) as idx
+                RETURN pivot_subnet,
+                       target_subnet,
+                       timestamps[idx] as timestamp,
+                       pivot_ips[idx] as pivot_ip,
+                       null as tactic,
+                       null as technique
+                ORDER BY pivot_subnet, timestamp
+                """
+            
+            result = session.run(query, 
+                                subnets=list(subnets_in_events),
+                                min_time=min_time,
+                                max_time=max_time).data()
+            
+            print(f"    ✓ Fetched {len(result)} lateral movement attacks")
+            
+            if len(result) == 0:
+                print("    ⚠ WARNING: No lateral movement attacks found!")
+                print("      All events will be classified as non-pivots.")
+            
+            print(f"    Processing pivot behaviors in memory...")
+            
+            # Build subnet -> [(timestamp, ip, target_subnet, tactic)] mapping
+            subnet_lateral_moves = defaultdict(list)
+            for record in result:
+                subnet_lateral_moves[record['pivot_subnet']].append({
+                    'timestamp': record['timestamp'],
+                    'pivot_ip': record['pivot_ip'],
+                    'target_subnet': record['target_subnet'],
+                    'tactic': record.get('tactic'),
+                    'technique': record.get('technique')
                 })
             
-            return batch_results
+            # Now check each event against the lateral movements
+            pivot_map = {}
+            for event in events:
+                subnet = event['victim_subnet']
+                recon_time = event['recon_time']
+                
+                # Filter lateral movements that happened after recon_time
+                lateral_moves = [
+                    move for move in subnet_lateral_moves.get(subnet, [])
+                    if recon_time < move['timestamp'] <= recon_time + det_window_sec
+                ]
+                
+                # Get unique pivot IPs and target subnets
+                pivot_ips = list(set(move['pivot_ip'] for move in lateral_moves))[:5]
+                target_subnets = list(set(move['target_subnet'] for move in lateral_moves))[:5]
+                tactics = list(set(move['tactic'] for move in lateral_moves if move['tactic']))[:5]
+                
+                key = (subnet, recon_time)
+                pivot_map[key] = {
+                    'became_pivot': len(lateral_moves) > 0,
+                    'attack_count': len(lateral_moves),
+                    'pivot_ips': pivot_ips,
+                    'target_subnets': target_subnets,
+                    'tactics': tactics
+                }
+            
+            # Count how many are actually pivots
+            pivot_count = sum(1 for v in pivot_map.values() if v['became_pivot'])
+            pivot_pct = (pivot_count / len(pivot_map) * 100) if pivot_map else 0
+            
+            print(f"    ✓ Loaded pivot behaviors for {len(pivot_map)} events")
+            print(f"    ✓ {pivot_count} ({pivot_pct:.1f}%) are TRUE PIVOTS (lateral movement detected)")
+            
+            return pivot_map
     
     def perform_statistical_analysis(self, test_df: pd.DataFrame, output_prefix: str):
         """Perform statistical significance testing."""
