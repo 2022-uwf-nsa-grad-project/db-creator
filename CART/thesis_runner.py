@@ -433,7 +433,11 @@ class ThesisRunner:
             self.logger.info(f"\n[{i}/{len(window_configs)}] Testing: historical={hist_hours}h, detection={det_hours}h")
             
             try:
-                self.analyzer.connect()
+                if not self.analyzer.connect():
+                    raise RuntimeError("Failed to connect to Neo4j")
+
+                # Ensure subnet metadata exists before building graph projections
+                self.analyzer.add_subnet_labels()
                 
                 prefix = f"window_opt_{hist_hours}_{det_hours}"
                 self.analyzer.run_pivot_prediction(

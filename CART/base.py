@@ -6,6 +6,7 @@ import socket
 import shutil
 import subprocess
 import getpass
+import ipaddress
 from typing import Optional
 
 # Imports used by build_database helpers
@@ -48,6 +49,10 @@ class Neo4jConnection:
         self.heap_max = heap_max
         self.http_port = None
         self._docker_path = None
+        # None = unknown, False = don't use sudo, True = prefix docker calls with sudo
+        self._use_sudo = None
+        # Cached sudo password (None = not provided / passwordless sudo)
+        self._sudo_password = None
         
         # Connection configuration
         self.uri = uri or f"bolt://localhost:{bolt_port}"
@@ -130,6 +135,19 @@ class Neo4jConnection:
             except socket.error:
                 return False
 
+    def _ipv4_to_subnet(self, ip_address: Optional[str], prefix_len: int = 24) -> Optional[str]:
+        """Convert an IPv4 address string into a canonical subnet (e.g., 192.168.1.0/24)."""
+        if not ip_address:
+            return None
+        try:
+            addr = ipaddress.ip_address(ip_address)
+            if isinstance(addr, ipaddress.IPv4Address):
+                network = ipaddress.ip_network(f"{ip_address}/{prefix_len}", strict=False)
+                return str(network)
+        except ValueError:
+            return None
+        return None
+
     def _get_available_http_port(self) -> Optional[int]:
         """Get an available HTTP port (tries 7474 then 8080)."""
         if self._check_port_available(7474):
@@ -151,26 +169,57 @@ class Neo4jConnection:
             proc = subprocess.run(["docker", "image", "ls"], capture_output=True)
             if proc.returncode == 0:
                 self._docker_path = shutil.which("docker") or "docker"
+                self._use_sudo = False
+                self._sudo_password = None
                 return
+            # If docker exists but returned non-zero, we'll try to detect if sudo helps below
         except FileNotFoundError:
             proc = None
 
-        # If the simple call failed, try locating docker via shutil.which
+        # If the simple call didn't succeed, try locating docker via shutil.which
         docker_path = shutil.which("docker")
         if docker_path:
-            # try running with absolute path
+            # try running with absolute path without sudo
             try:
                 proc2 = subprocess.run([docker_path, "image", "ls"], capture_output=True)
                 if proc2.returncode == 0:
                     self._docker_path = docker_path
+                    self._use_sudo = False
+                    self._sudo_password = None
                     return
-                else:
-                    stderr = proc2.stderr.decode().strip() if proc2.stderr else ""
-                    raise RuntimeError(f"Docker appears to be installed but not usable: {stderr}")
+                # If non-zero, try with sudo to see if the daemon is permission-locked.
+                # First try passwordless sudo (-n). If that fails, prompt the user for a sudo password
+                # and try again with -S, supplying the password via stdin.
+                try:
+                    proc2_sudo = subprocess.run(["sudo", "-n", docker_path, "image", "ls"], capture_output=True, text=True)
+                    if proc2_sudo.returncode == 0:
+                        self._docker_path = docker_path
+                        self._use_sudo = True
+                        self._sudo_password = None
+                        return
+                except FileNotFoundError:
+                    proc2_sudo = None
+
+                try:
+                    sudo_pw = getpass.getpass("sudo password required to run docker commands (will be used for this session): ")
+                    if sudo_pw:
+                        proc2_sudo_pw = subprocess.run(["sudo", "-S", docker_path, "image", "ls"], input=sudo_pw + "\n", capture_output=True, text=True)
+                        if proc2_sudo_pw.returncode == 0:
+                            self._docker_path = docker_path
+                            self._use_sudo = True
+                            self._sudo_password = sudo_pw
+                            return
+                        else:
+                            stderr = (proc2.stderr or "") + "\n" + (proc2_sudo_pw.stderr or "")
+                            stderr = stderr.strip()
+                            raise RuntimeError(f"Docker appears to be installed but not usable: {stderr}")
+                except Exception:
+                    # fall through to try other locations
+                    pass
             except FileNotFoundError:
                 pass
 
-        # Try common locations (Homebrew on Intel/M1 and typical paths)
+        # Try common locations (typical paths)
         common = [
             "/usr/local/bin/docker",
             "/opt/homebrew/bin/docker",
@@ -182,25 +231,94 @@ class Neo4jConnection:
                     proc3 = subprocess.run([p, "image", "ls"], capture_output=True)
                     if proc3.returncode == 0:
                         self._docker_path = p
+                        self._use_sudo = False
+                        self._sudo_password = None
                         return
+                    # try passwordless sudo first
+                    try:
+                        proc3_sudo = subprocess.run(["sudo", "-n", p, "image", "ls"], capture_output=True, text=True)
+                        if proc3_sudo.returncode == 0:
+                            self._docker_path = p
+                            self._use_sudo = True
+                            self._sudo_password = None
+                            return
+                    except FileNotFoundError:
+                        proc3_sudo = None
+
+                    # Prompt for sudo password if passwordless sudo didn't work
+                    try:
+                        sudo_pw = getpass.getpass("sudo password required to run docker commands (will be used for this session): ")
+                        if sudo_pw:
+                            proc3_sudo_pw = subprocess.run(["sudo", "-S", p, "image", "ls"], input=sudo_pw + "\n", capture_output=True, text=True)
+                            if proc3_sudo_pw.returncode == 0:
+                                self._docker_path = p
+                                self._use_sudo = True
+                                self._sudo_password = sudo_pw
+                                return
+                    except Exception:
+                        pass
                 except FileNotFoundError:
                     continue
 
         # Nothing worked
-        raise RuntimeError("Docker CLI not found or not usable. Please install Docker or ensure 'docker' is on PATH and the daemon is running.")
+        raise RuntimeError("Docker CLI not found or not usable. Please install Docker or ensure 'docker' is on PATH and the daemon is running, or that your user is in the 'docker' group.")
 
     def _docker_run(self, args, **kwargs):
         """Run a docker command with resolved executable path."""
         if not getattr(self, "_docker_path", None):
             self._ensure_docker_available()
-        cmd = [self._docker_path] + args
+        kwargs = dict(kwargs)
+
+        if self._use_sudo:
+            if self._sudo_password:
+                sudo_prefix = ["sudo", "-S"]
+                password_input = (self._sudo_password + "\n").encode()
+                if "input" in kwargs and kwargs["input"] is not None:
+                    existing_input = kwargs["input"]
+                    if isinstance(existing_input, str):
+                        existing_input = existing_input.encode()
+                    kwargs["input"] = password_input + existing_input
+                else:
+                    kwargs["input"] = password_input
+                kwargs.pop("text", None)
+                kwargs.pop("encoding", None)
+            else:
+                sudo_prefix = ["sudo", "-n"]
+                if "input" in kwargs and kwargs["input"] is None:
+                    kwargs.pop("input")
+            cmd = sudo_prefix + [self._docker_path] + args
+        else:
+            cmd = [self._docker_path] + args
+
         return subprocess.run(cmd, **kwargs)
 
     def _docker_check_output(self, args, **kwargs):
         """Run docker command and return output (like check_output)."""
         if not getattr(self, "_docker_path", None):
             self._ensure_docker_available()
-        cmd = [self._docker_path] + args
+        kwargs = dict(kwargs)
+
+        if self._use_sudo:
+            if self._sudo_password:
+                sudo_prefix = ["sudo", "-S"]
+                password_input = (self._sudo_password + "\n").encode()
+                if "input" in kwargs and kwargs["input"] is not None:
+                    existing_input = kwargs["input"]
+                    if isinstance(existing_input, str):
+                        existing_input = existing_input.encode()
+                    kwargs["input"] = password_input + existing_input
+                else:
+                    kwargs["input"] = password_input
+                kwargs.pop("text", None)
+                kwargs.pop("encoding", None)
+            else:
+                sudo_prefix = ["sudo", "-n"]
+                if "input" in kwargs and kwargs["input"] is None:
+                    kwargs.pop("input")
+            cmd = sudo_prefix + [self._docker_path] + args
+        else:
+            cmd = [self._docker_path] + args
+
         return subprocess.check_output(cmd, **kwargs)
 
     def _get_container_logs(self, tail: Optional[int] = None) -> str:
@@ -623,17 +741,27 @@ class Neo4jConnection:
                         batch['label_binary'] = batch['label_binary'].astype(bool).astype(int)
                         
                         # Convert to records - only select needed columns
-                        records = batch[[
-                            'src_ip_zeek', 'dest_ip_zeek', 'ts', 'duration', 
-                            'service', 'dest_port_zeek', 'conn_state', 
+                        essential_cols = [
+                            'src_ip_zeek', 'dest_ip_zeek', 'ts', 'duration',
+                            'service', 'dest_port_zeek', 'conn_state',
                             'label_tactic', 'label_technique', 'label_binary'
-                        ]].to_dict('records')
-                        
+                        ]
+                        records = []
+                        for row in batch[essential_cols].to_dict('records'):
+                            row['src_subnet'] = self._ipv4_to_subnet(row['src_ip_zeek'])
+                            row['dest_subnet'] = self._ipv4_to_subnet(row['dest_ip_zeek'])
+                            records.append(row)
+
                         # Optimized query with MERGE for IPs (avoids duplicates)
+                        # Also compute and set a /24 subnet on each IP node so downstream analyses
+                        # that expect subnet metadata will succeed. Use coalesce to preserve existing values.
                         query = """
                         UNWIND $records AS row
                         MERGE (orig:IP {address: row.src_ip_zeek})
                         MERGE (resp:IP {address: row.dest_ip_zeek})
+                        // apply subnet metadata only when available from preprocessing
+                        SET orig.subnet = coalesce(orig.subnet, row.src_subnet)
+                        SET resp.subnet = coalesce(resp.subnet, row.dest_subnet)
                         CREATE (orig)-[:CONNECTS {
                             timestamp: row.ts,
                             duration: row.duration,

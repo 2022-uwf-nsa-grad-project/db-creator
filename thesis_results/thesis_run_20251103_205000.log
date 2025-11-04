@@ -1,0 +1,8 @@
+2025-11-03 20:50:00 - ThesisRunner - INFO - Initializing SubnetPivotAnalyzer...
+2025-11-03 20:50:00 - ThesisRunner - INFO - ThesisRunner initialized
+2025-11-03 20:50:00 - ThesisRunner - INFO - Results directory: /home/treverknie/db-creator/thesis_results
+2025-11-03 20:50:00 - ThesisRunner - INFO - Figures directory: /home/treverknie/db-creator/thesis_figures
+2025-11-03 20:50:00 - ThesisRunner - INFO - ================================================================================
+2025-11-03 20:50:00 - ThesisRunner - INFO - EXPLORING DATABASE
+2025-11-03 20:50:00 - ThesisRunner - INFO - ================================================================================
+2025-11-03 20:50:00 - ThesisRunner - ERROR - Database exploration failed: Docker appears to be installed but not usable: permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Head "http://%2Fvar%2Frun%2Fdocker.sock/_ping": dial unix /var/run/docker.sock: connect: permission denied
