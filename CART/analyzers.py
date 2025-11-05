@@ -1,175 +1,212 @@
 from .base import Neo4jConnection
-from typing import Optional, Dict, List, Tuple
-import pandas as pd
-import numpy as np
-import networkx as nx
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_curve
-import time
-import warnings
-import json
-from tqdm import tqdm
-from scipy import stats
-from collections import defaultdict
-import ipaddress
+    def visualize_results(self, test_df: pd.DataFrame, output_prefix: str):
+        """Generate comprehensive visualizations."""
+        print(f"\n--- Generating Visualizations ---")
 
-warnings.filterwarnings('ignore')
+        def normalize_flag(value):
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+            if isinstance(value, (int, np.integer)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {'true', '1', 'yes', 'y'}:
+                    return True
+                if lowered in {'false', '0', 'no', 'n'}:
+                    return False
+            return np.nan
 
+        plot_df = test_df.copy()
+        plot_df['became_pivot_flag'] = plot_df['became_pivot'].apply(normalize_flag)
+        unknown_mask = plot_df['became_pivot_flag'].isna()
+        if unknown_mask.any():
+            print(f"  ⚠ Dropping {unknown_mask.sum()} samples with unrecognized became_pivot values for visualization.")
+            plot_df = plot_df.loc[~unknown_mask].copy()
 
-class TemporalWindowAnalyzer(Neo4jConnection):
-    """
-    Analyzes optimal temporal windows for pivot behavior detection.
-    Determines appropriate historical observation periods and pivot detection windows.
-    """
-    
-    def __init__(self, connection: Optional[Neo4jConnection] = None,
-                 uri="bolt://localhost:7687", user="neo4j", password=None,
-                 database="neo4j", container_name="neo4j_temporal_analyzer", **kwargs):
-        if connection is not None:
-            self._shared_connection = connection
-            self.driver = connection.driver
-            self.uri = connection.uri
-            self.user = connection.user
-            self.password = connection.password
-            self.database = connection.database
-            self.container_name = connection.container_name
-            self._owns_driver = False
-        else:
-            super().__init__(uri=uri, user=user, password=password,
-                             database=database, container_name=container_name, **kwargs)
-            self._shared_connection = None
-            self._owns_driver = True
-
-    def start(self, password: Optional[str] = None):
-        if getattr(self, "_shared_connection", None):
-            return self._shared_connection.start(password)
-        return super().start(password)
-
-    def stop(self):
-        if getattr(self, "_shared_connection", None):
-            return self._shared_connection.stop()
-        return super().stop()
-
-    def remove(self):
-        if getattr(self, "_shared_connection", None):
-            return self._shared_connection.remove()
-        return super().remove()
-
-    def restart(self):
-        if getattr(self, "_shared_connection", None):
-            return self._shared_connection.restart()
-        return super().restart()
-
-    def connect(self):
-        if getattr(self, "_shared_connection", None):
-            ok = self._shared_connection.connect()
-            self.driver = self._shared_connection.driver
-            return ok
-        return super().connect()
-
-    def close(self):
-        if getattr(self, "_shared_connection", None):
-            print("Shared connection managed by controller; not closing driver here.")
+        if plot_df.empty:
+            print("  ⚠ Visualization skipped; no valid samples after filtering became_pivot values.")
             return
-        return super().close()
-    
-    def run_analysis(self, output_filepath="temporal_window_analysis.json"):
-        """Runs comprehensive temporal window analysis."""
-        try:
-            if not self.connect():
-                print("Could not connect to Neo4j; aborting temporal analysis.")
-                return
-            
-            print("\n" + "="*80)
-            print("TEMPORAL WINDOW ANALYSIS FOR PIVOT DETECTION")
-            print("="*80)
-            
-            # Analyze pivot timing distributions
-            pivot_timings = self.analyze_pivot_timing_distribution()
-            
-            # Test different historical windows
-            window_results = self.test_historical_windows([3600, 12*3600, 24*3600, 48*3600])
-            
-            # Test different pivot detection windows
-            detection_results = self.test_pivot_detection_windows([3600, 6*3600, 12*3600, 24*3600, 48*3600])
-            
-            # Generate recommendations
-            recommendations = self.generate_recommendations(pivot_timings, window_results, detection_results)
-            
-            # Save results
-            results = {
-                'pivot_timings': pivot_timings,
-                'historical_window_tests': window_results,
-                'detection_window_tests': detection_results,
-                'recommendations': recommendations
-            }
-            
-            with open(output_filepath, 'w') as f:
-                json.dump(results, f, indent=4)
-            
-            print(f"\n✓ Results saved to {output_filepath}")
-            self.visualize_temporal_analysis(results)
-            
-        finally:
-            self.close()
-    
-    def analyze_pivot_timing_distribution(self):
-        """Analyze the time distribution between reconnaissance and pivot attacks."""
-        print("\n--- Analyzing Pivot Timing Distribution ---")
-        
-        with self.driver.session(database=self.database) as session:
-            query = """
-            MATCH (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)
-            WHERE r1.is_attack = 1 AND r1.tactic = 'Reconnaissance'
-              AND r2.is_attack = 1 AND r2.timestamp > r1.timestamp
-              AND a <> c
-            WITH (r2.timestamp - r1.timestamp) as time_diff
-            WHERE time_diff > 0 AND time_diff < 7*24*3600  // Within 1 week
-            RETURN 
-                time_diff / 3600 as hours_to_pivot,
-                count(*) as frequency
-            ORDER BY hours_to_pivot
-            """
-            
-            result = session.run(query).data()
-            
-            if not result:
-                print("  ⚠ No pivot timing data found")
-                return {}
-            
-            df = pd.DataFrame(result)
-            
-            percentiles = [10, 25, 50, 75, 90, 95, 99]
-            stats_dict = {
-                'mean_hours': float(df['hours_to_pivot'].mean()),
-                'median_hours': float(df['hours_to_pivot'].median()),
-                'std_hours': float(df['hours_to_pivot'].std()),
-                'percentiles': {f'p{p}': float(np.percentile(df['hours_to_pivot'], p)) for p in percentiles},
-                'total_pivots': int(df['frequency'].sum())
-            }
-            
-            print(f"\n  Pivot Timing Statistics:")
-            print(f"    Total pivots analyzed: {stats_dict['total_pivots']:,}")
-            print(f"    Mean time to pivot: {stats_dict['mean_hours']:.2f} hours")
-            print(f"    Median time to pivot: {stats_dict['median_hours']:.2f} hours")
-            print(f"\n  Percentiles:")
-            for p, val in stats_dict['percentiles'].items():
-                print(f"    {p}: {val:.2f} hours")
-            
-            return stats_dict
-    
-    def test_historical_windows(self, window_sizes: List[int]):
-        """Test different historical window sizes for feature extraction."""
-        print("\n--- Testing Historical Window Sizes ---")
-        
-        results = []
-        
-        with self.driver.session(database=self.database) as session:
-            for window_sec in tqdm(window_sizes, desc="Testing windows"):
-                window_hours = window_sec / 3600
-                
+
+        plot_df['became_pivot_label'] = plot_df['became_pivot_flag'].map({True: 'Yes', False: 'No'})
+
+        fig, axes = plt.subplots(3, 3, figsize=(20, 18))
+
+        pivot_df = plot_df[plot_df['became_pivot_flag']]
+        non_pivot_df = plot_df[~plot_df['became_pivot_flag']]
+        y_true = plot_df['became_pivot_flag'].astype(int)
+
+        # Plot 1: FastRP similarity distribution
+        ax = axes[0, 0]
+        ax.hist(non_pivot_df['fastrp_similarity'], bins=30, alpha=0.5,
+                label='Non-Pivots', color='blue', edgecolor='black')
+        ax.hist(pivot_df['fastrp_similarity'], bins=30, alpha=0.5,
+                label='Pivots', color='red', edgecolor='black')
+        if not pivot_df.empty:
+            ax.axvline(pivot_df['fastrp_similarity'].mean(), color='red', linestyle='--',
+                       label=f'Pivot Mean: {pivot_df["fastrp_similarity"].mean():.3f}')
+        if not non_pivot_df.empty:
+            ax.axvline(non_pivot_df['fastrp_similarity'].mean(), color='blue', linestyle='--',
+                       label=f'Non-Pivot Mean: {non_pivot_df["fastrp_similarity"].mean():.3f}')
+        ax.set_xlabel('FastRP Similarity to Reference Pivot')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Distribution of FastRP Similarity Scores')
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+        # Plot 2: ROC Curve
+        ax = axes[0, 1]
+        fpr, tpr, _ = roc_curve(y_true, plot_df['fastrp_similarity'])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, lw=2, color='red', label=f'FastRP (AUC={roc_auc:.3f})')
+        ax.fill_between(fpr, tpr, alpha=0.2, color='red')
+        ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Random')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('Receiver Operating Characteristic')
+        ax.legend(loc='lower right')
+        ax.grid(alpha=0.3)
+
+        # Plot 3: Precision-Recall Curve
+        ax = axes[0, 2]
+        precision, recall, _ = precision_recall_curve(y_true, plot_df['fastrp_similarity'])
+        pr_auc = auc(recall, precision)
+        ax.plot(recall, precision, lw=2, color='purple', label=f'FastRP (AUC={pr_auc:.3f})')
+        ax.fill_between(recall, precision, alpha=0.2, color='purple')
+        ax.set_xlabel('Recall')
+        ax.set_ylabel('Precision')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.05)
+        ax.set_title('Precision-Recall Curve')
+        ax.legend(loc='lower left')
+        ax.grid(alpha=0.3)
+
+        # Plot 4: Attack Count Distribution
+        ax = axes[1, 0]
+        if 'attack_count' in plot_df.columns:
+            sns.histplot(
+                data=plot_df,
+                x='attack_count',
+                hue='became_pivot_label',
+                multiple='stack',
+                bins=20,
+                palette={'Yes': 'red', 'No': 'blue'},
+                ax=ax
+            )
+            ax.set_xlabel('Attack Count within Detection Window')
+            ax.set_ylabel('Events')
+            ax.set_title('Attack Count Distribution')
+            legend = ax.get_legend()
+            if legend:
+                legend.set_title('Became Pivot')
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'attack_count column missing', ha='center', va='center')
+
+        # Plot 5: Subnet Size by Outcome
+        ax = axes[1, 1]
+        if 'subnet_size' in plot_df.columns:
+            sns.boxplot(
+                data=plot_df,
+                x='became_pivot_label',
+                y='subnet_size',
+                palette={'Yes': 'red', 'No': 'blue'},
+                ax=ax
+            )
+            ax.set_xlabel('Became Pivot')
+            ax.set_ylabel('Subnet Size (# IPs)')
+            ax.set_title('Subnet Size by Outcome')
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'subnet_size column missing', ha='center', va='center')
+
+        # Plot 6: PageRank vs FastRP Similarity
+        ax = axes[1, 2]
+        if 'avg_pagerank' in plot_df.columns:
+            sns.scatterplot(
+                data=plot_df,
+                x='avg_pagerank',
+                y='fastrp_similarity',
+                hue='became_pivot_label',
+                palette={'Yes': 'red', 'No': 'blue'},
+                alpha=0.6,
+                ax=ax
+            )
+            ax.set_xlabel('Average PageRank')
+            ax.set_ylabel('FastRP Similarity')
+            ax.set_title('PageRank vs FastRP Similarity')
+            legend = ax.get_legend()
+            if legend:
+                legend.set_title('Became Pivot')
+            ax.grid(alpha=0.3)
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'avg_pagerank column missing', ha='center', va='center')
+
+        # Plot 7: Connection Velocity vs Burstiness
+        ax = axes[2, 0]
+        if {'avg_velocity', 'avg_burst'}.issubset(plot_df.columns):
+            sns.scatterplot(
+                data=plot_df,
+                x='avg_velocity',
+                y='avg_burst',
+                hue='became_pivot_label',
+                palette={'Yes': 'red', 'No': 'blue'},
+                alpha=0.6,
+                ax=ax
+            )
+            ax.set_xlabel('Average Connection Velocity (conn/hour)')
+            ax.set_ylabel('Average Burst Score')
+            ax.set_title('Velocity vs Burstiness')
+            legend = ax.get_legend()
+            if legend:
+                legend.set_title('Became Pivot')
+            ax.grid(alpha=0.3)
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'velocity/burst columns missing', ha='center', va='center')
+
+        # Plot 8: Betweenness by Outcome
+        ax = axes[2, 1]
+        if 'avg_betweenness' in plot_df.columns:
+            sns.violinplot(
+                data=plot_df,
+                x='became_pivot_label',
+                y='avg_betweenness',
+                palette={'Yes': 'red', 'No': 'blue'},
+                cut=0,
+                ax=ax
+            )
+            ax.set_xlabel('Became Pivot')
+            ax.set_ylabel('Average Betweenness')
+            ax.set_title('Betweenness by Outcome')
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'avg_betweenness column missing', ha='center', va='center')
+
+        # Plot 9: Pivot Rate by FastRP Similarity Decile
+        ax = axes[2, 2]
+        if plot_df['fastrp_similarity'].nunique() > 1:
+            num_bins = min(10, plot_df['fastrp_similarity'].nunique())
+            deciles = pd.qcut(plot_df['fastrp_similarity'], q=num_bins, duplicates='drop')
+            decile_df = plot_df.assign(similarity_decile=deciles)
+            pivot_rates = decile_df.groupby('similarity_decile')['became_pivot_flag'].mean().reset_index()
+            pivot_rates['interval'] = pivot_rates['similarity_decile'].apply(
+                lambda interval: f"{interval.left:.2f}-{interval.right:.2f}"
+            )
+            ax.bar(pivot_rates['interval'], pivot_rates['became_pivot_flag'] * 100, color='teal')
+            ax.set_xticklabels(pivot_rates['interval'], rotation=45, ha='right')
+            ax.set_xlabel('FastRP Similarity Range')
+            ax.set_ylabel('Pivot Rate (%)')
+            ax.set_title('Pivot Rate by Similarity Decile')
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'Insufficient similarity variance', ha='center', va='center')
+
+        plt.tight_layout()
+        output_path = f'{output_prefix}_visualizations.png'
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  ✓ Saved visualizations to '{output_path}'")
                 query = """
                 MATCH (victim:IP)
                 WHERE exists((victim)<-[:CONNECTS]-(:IP))

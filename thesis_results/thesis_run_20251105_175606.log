@@ -1,0 +1,9 @@
+2025-11-05 17:56:06 - ThesisRunner - INFO - Initializing SubnetPivotAnalyzer...
+2025-11-05 17:56:06 - ThesisRunner - INFO - ThesisRunner initialized
+2025-11-05 17:56:06 - ThesisRunner - INFO - Results directory: /home/treverknie/db-creator/thesis_results
+2025-11-05 17:56:06 - ThesisRunner - INFO - Figures directory: /home/treverknie/db-creator/thesis_figures
+2025-11-05 17:56:06 - ThesisRunner - INFO - ================================================================================
+2025-11-05 17:56:06 - ThesisRunner - INFO - RUNNING QUICK PIVOT DETECTION TEST
+2025-11-05 17:56:06 - ThesisRunner - INFO - ================================================================================
+2025-11-05 17:56:06 - ThesisRunner - INFO - Configuration: dim=128, window=24h, max_events=10000
+2025-11-05 17:59:57 - ThesisRunner - ERROR - Quick test failed: 'set'

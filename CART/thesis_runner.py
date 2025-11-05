@@ -327,6 +327,8 @@ class ThesisRunner:
         
         try:
             self.analyzer.connect()
+            # Ensure subnet metadata exists before running projections
+            self.analyzer.add_subnet_labels()
             
             # Run pivot prediction (generates CSV files)
             self.analyzer.run_pivot_prediction(
@@ -475,7 +477,8 @@ class ThesisRunner:
                     'auc_roc': fastRP_metrics['AUC-ROC'],
                     'auc_pr': fastRP_metrics['AUC-PR'],
                     'f1_score': fastRP_metrics['F1-Score'],
-                    'accuracy': fastRP_metrics['Accuracy']
+                    'accuracy': fastRP_metrics['Accuracy'],
+                    'error': None
                 })
                 
                 self.logger.info(f"  ✓ AUC-ROC: {fastRP_metrics['AUC-ROC']:.4f}, "
@@ -487,6 +490,14 @@ class ThesisRunner:
                 results_list.append({
                     'historical_hours': hist_hours,
                     'detection_hours': det_hours,
+                    'train_pivot_rate': None,
+                    'test_pivot_rate': None,
+                    'p_value': None,
+                    'cohens_d': None,
+                    'auc_roc': None,
+                    'auc_pr': None,
+                    'f1_score': None,
+                    'accuracy': None,
                     'error': str(e)
                 })
             finally:
@@ -538,6 +549,7 @@ class ThesisRunner:
         
         try:
             self.analyzer.connect()
+            self.analyzer.add_subnet_labels()
             
             self.analyzer.run_pivot_prediction(
                 use_labels=True,
@@ -597,6 +609,7 @@ class ThesisRunner:
         
         try:
             self.analyzer.connect()
+            self.analyzer.add_subnet_labels()
             
             self.analyzer.run_pivot_prediction(
                 use_labels=False,

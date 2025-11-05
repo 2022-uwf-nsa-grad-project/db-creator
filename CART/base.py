@@ -160,108 +160,18 @@ class Neo4jConnection:
         return None
 
     def _ensure_docker_available(self) -> None:
-        """Ensure Docker CLI is available and responding (uses `docker image ls`).
+        """Ensure Docker CLI is available using 'which docker'.
 
-        Raises RuntimeError when Docker is missing or the daemon is not responding.
+        Raises RuntimeError when Docker is missing.
         """
-        # Try the simple call first (works when 'docker' is on PATH)
-        try:
-            proc = subprocess.run(["docker", "image", "ls"], capture_output=True)
-            if proc.returncode == 0:
-                self._docker_path = shutil.which("docker") or "docker"
-                self._use_sudo = False
-                self._sudo_password = None
-                return
-            # If docker exists but returned non-zero, we'll try to detect if sudo helps below
-        except FileNotFoundError:
-            proc = None
-
-        # If the simple call didn't succeed, try locating docker via shutil.which
         docker_path = shutil.which("docker")
-        if docker_path:
-            # try running with absolute path without sudo
-            try:
-                proc2 = subprocess.run([docker_path, "image", "ls"], capture_output=True)
-                if proc2.returncode == 0:
-                    self._docker_path = docker_path
-                    self._use_sudo = False
-                    self._sudo_password = None
-                    return
-                # If non-zero, try with sudo to see if the daemon is permission-locked.
-                # First try passwordless sudo (-n). If that fails, prompt the user for a sudo password
-                # and try again with -S, supplying the password via stdin.
-                try:
-                    proc2_sudo = subprocess.run(["sudo", "-n", docker_path, "image", "ls"], capture_output=True, text=True)
-                    if proc2_sudo.returncode == 0:
-                        self._docker_path = docker_path
-                        self._use_sudo = True
-                        self._sudo_password = None
-                        return
-                except FileNotFoundError:
-                    proc2_sudo = None
-
-                try:
-                    sudo_pw = getpass.getpass("sudo password required to run docker commands (will be used for this session): ")
-                    if sudo_pw:
-                        proc2_sudo_pw = subprocess.run(["sudo", "-S", docker_path, "image", "ls"], input=sudo_pw + "\n", capture_output=True, text=True)
-                        if proc2_sudo_pw.returncode == 0:
-                            self._docker_path = docker_path
-                            self._use_sudo = True
-                            self._sudo_password = sudo_pw
-                            return
-                        else:
-                            stderr = (proc2.stderr or "") + "\n" + (proc2_sudo_pw.stderr or "")
-                            stderr = stderr.strip()
-                            raise RuntimeError(f"Docker appears to be installed but not usable: {stderr}")
-                except Exception:
-                    # fall through to try other locations
-                    pass
-            except FileNotFoundError:
-                pass
-
-        # Try common locations (typical paths)
-        common = [
-            "/usr/local/bin/docker",
-            "/opt/homebrew/bin/docker",
-            "/usr/bin/docker",
-        ]
-        for p in common:
-            if os.path.exists(p) and os.access(p, os.X_OK):
-                try:
-                    proc3 = subprocess.run([p, "image", "ls"], capture_output=True)
-                    if proc3.returncode == 0:
-                        self._docker_path = p
-                        self._use_sudo = False
-                        self._sudo_password = None
-                        return
-                    # try passwordless sudo first
-                    try:
-                        proc3_sudo = subprocess.run(["sudo", "-n", p, "image", "ls"], capture_output=True, text=True)
-                        if proc3_sudo.returncode == 0:
-                            self._docker_path = p
-                            self._use_sudo = True
-                            self._sudo_password = None
-                            return
-                    except FileNotFoundError:
-                        proc3_sudo = None
-
-                    # Prompt for sudo password if passwordless sudo didn't work
-                    try:
-                        sudo_pw = getpass.getpass("sudo password required to run docker commands (will be used for this session): ")
-                        if sudo_pw:
-                            proc3_sudo_pw = subprocess.run(["sudo", "-S", p, "image", "ls"], input=sudo_pw + "\n", capture_output=True, text=True)
-                            if proc3_sudo_pw.returncode == 0:
-                                self._docker_path = p
-                                self._use_sudo = True
-                                self._sudo_password = sudo_pw
-                                return
-                    except Exception:
-                        pass
-                except FileNotFoundError:
-                    continue
-
-        # Nothing worked
-        raise RuntimeError("Docker CLI not found or not usable. Please install Docker or ensure 'docker' is on PATH and the daemon is running, or that your user is in the 'docker' group.")
+        if not docker_path:
+            raise RuntimeError("Docker CLI not found. Please install Docker and ensure it is on your PATH.")
+        self._docker_path = docker_path
+        # Sudo fallback will be handled elsewhere if daemon issues arise
+        self._use_sudo = False
+        self._sudo_password = None
+        return
 
     def _docker_run(self, args, **kwargs):
         """Run a docker command with resolved executable path."""
@@ -473,6 +383,19 @@ class Neo4jConnection:
         except RuntimeError:
             raise
 
+        # Test if we need sudo by trying a simple docker command
+        try:
+            test_proc = self._docker_run(["version"], capture_output=True, check=False)
+            if test_proc.returncode != 0:
+                stderr = test_proc.stderr.decode().strip() if test_proc.stderr else ""
+                if "permission denied" in stderr.lower():
+                    print("Docker requires sudo privileges.")
+                    sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
+                    self._use_sudo = True
+                    self._sudo_password = sudo_pw
+        except Exception:
+            pass
+
         # If a container with the desired name is already running and exposes
         # the standard HTTP port (7474), don't start a second container.
         try:
@@ -496,11 +419,51 @@ class Neo4jConnection:
                 print(f"Docker image '{self.neo4j_image}' not found locally. Pulling...")
                 pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
                 if pull_proc.returncode != 0:
-                    print(f"Failed to pull image '{self.neo4j_image}': {pull_proc.stderr.decode().strip()}")
-                    return False
+                    stderr = pull_proc.stderr.decode().strip()
+                    print(f"Failed to pull image '{self.neo4j_image}': {stderr}")
+                    # Check for permission denied
+                    if "permission denied" in stderr.lower():
+                        print("Permission denied when accessing Docker daemon. Sudo is required.")
+                        sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
+                        self._use_sudo = True
+                        self._sudo_password = sudo_pw
+                        # Retry the pull with sudo
+                        pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
+                        if pull_proc.returncode != 0:
+                            print(f"Failed to pull image with sudo: {pull_proc.stderr.decode().strip()}")
+                            return False
+                    else:
+                        return False
                 print(f"Successfully pulled '{self.neo4j_image}'.")
             else:
                 print(f"Docker image '{self.neo4j_image}' found locally: {image_id}")
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode().strip() if e.stderr else str(e)
+            # Check for permission denied in the exception
+            if "permission denied" in stderr.lower():
+                print("Permission denied when accessing Docker daemon. Sudo is required.")
+                sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
+                self._use_sudo = True
+                self._sudo_password = sudo_pw
+                # Retry checking for image with sudo
+                try:
+                    cmd_check = ["images", "-q", self.neo4j_image]
+                    proc = self._docker_run(cmd_check, capture_output=True, check=False)
+                    image_id = proc.stdout.decode().strip()
+                    if not image_id:
+                        print(f"Docker image '{self.neo4j_image}' not found locally. Pulling...")
+                        pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
+                        if pull_proc.returncode != 0:
+                            print(f"Failed to pull image with sudo: {pull_proc.stderr.decode().strip()}")
+                            return False
+                        print(f"Successfully pulled '{self.neo4j_image}'.")
+                    else:
+                        print(f"Docker image '{self.neo4j_image}' found locally: {image_id}")
+                except Exception as e2:
+                    print(f"Failed after sudo retry: {e2}")
+                    return False
+            else:
+                raise RuntimeError(f"Docker error: {stderr}")
         except FileNotFoundError:
             raise RuntimeError("Docker CLI not found. Please install Docker or ensure 'docker' is on PATH.")
 
@@ -525,9 +488,19 @@ class Neo4jConnection:
                 "--env", f"NEO4J_dbms_memory_heap_max__size={self.heap_max}",
                 self.neo4j_image
             ]
-            self._docker_run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            print(f"FATAL ERROR: Docker failed to start the Neo4j container: {e}")
+            result = self._docker_run(cmd, check=False, capture_output=True)
+            if result.returncode != 0:
+                stderr = result.stderr.decode().strip() if result.stderr else ""
+                stdout = result.stdout.decode().strip() if result.stdout else ""
+                print(f"FATAL ERROR: Docker failed to start the Neo4j container.")
+                print(f"Exit code: {result.returncode}")
+                if stderr:
+                    print(f"Error output: {stderr}")
+                if stdout:
+                    print(f"Standard output: {stdout}")
+                return False
+        except Exception as e:
+            print(f"FATAL ERROR: Exception when starting Neo4j container: {e}")
             return False
 
         print("Waiting for Neo4j Bolt to become available (this may take up to 2 minutes)...")
@@ -727,7 +700,7 @@ class Neo4jConnection:
                     print("DataFrame is empty. No data to write.")
                     return # Nothing else to do
 
-                batch_size = 15000  # Optimal batch size for Neo4j
+                batch_size = 25000  # Optimal batch size for Neo4j
                 
                 print(f"\nWriting {total_rows:,} rows in batches of {batch_size:,}...")
                 
@@ -748,8 +721,10 @@ class Neo4jConnection:
                         ]
                         records = []
                         for row in batch[essential_cols].to_dict('records'):
-                            row['src_subnet'] = self._ipv4_to_subnet(row['src_ip_zeek'])
-                            row['dest_subnet'] = self._ipv4_to_subnet(row['dest_ip_zeek'])
+                            src_subnet = self._ipv4_to_subnet(row['src_ip_zeek'])
+                            dest_subnet = self._ipv4_to_subnet(row['dest_ip_zeek'])
+                            row['src_subnet'] = src_subnet if src_subnet else 'UNKNOWN'
+                            row['dest_subnet'] = dest_subnet if dest_subnet else 'UNKNOWN'
                             records.append(row)
 
                         # Optimized query with MERGE for IPs (avoids duplicates)

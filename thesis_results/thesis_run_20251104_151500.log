@@ -1,0 +1,39 @@
+2025-11-04 15:15:00 - ThesisRunner - INFO - Initializing SubnetPivotAnalyzer...
+2025-11-04 15:15:00 - ThesisRunner - INFO - ThesisRunner initialized
+2025-11-04 15:15:00 - ThesisRunner - INFO - Results directory: /home/treverknie/db-creator/thesis_results
+2025-11-04 15:15:00 - ThesisRunner - INFO - Figures directory: /home/treverknie/db-creator/thesis_figures
+2025-11-04 15:15:00 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:15:00 - ThesisRunner - INFO - EXPLORING DATABASE
+2025-11-04 15:15:00 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:15:41 - ThesisRunner - INFO - ✓ Database exploration saved to thesis_results/database_exploration.json
+2025-11-04 15:15:41 - ThesisRunner - INFO -   - Nodes: N/A
+2025-11-04 15:15:41 - ThesisRunner - INFO -   - Relationships: N/A
+2025-11-04 15:15:41 - ThesisRunner - INFO -   - Subnets: 0
+2025-11-04 15:15:41 - ThesisRunner - INFO - ✓ Database exploration completed in 40.5s
+2025-11-04 15:15:41 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:15:41 - ThesisRunner - INFO - ANALYZING ATTACK TACTICS
+2025-11-04 15:15:41 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:15:41 - ThesisRunner - INFO - Analyzing overall tactic distribution...
+2025-11-04 15:15:48 - ThesisRunner - INFO -   none: 958,109 (50.46%)
+2025-11-04 15:15:48 - ThesisRunner - INFO -   Credential Access: 871,188 (45.89%)
+2025-11-04 15:15:48 - ThesisRunner - INFO -   Reconnaissance: 58,095 (3.06%)
+2025-11-04 15:15:48 - ThesisRunner - INFO -   Defense Evasion: 6,048 (0.32%)
+2025-11-04 15:15:48 - ThesisRunner - INFO -   Initial Access: 4,614 (0.24%)
+2025-11-04 15:15:48 - ThesisRunner - INFO -   Exfiltration: 559 (0.03%)
+2025-11-04 15:15:48 - ThesisRunner - INFO - Analyzing cross-subnet attacks...
+2025-11-04 15:15:48 - ThesisRunner - INFO - Analyzing techniques by tactic...
+2025-11-04 15:15:57 - ThesisRunner - INFO -   none: 1 unique techniques
+2025-11-04 15:15:57 - ThesisRunner - INFO -   Credential Access: 1 unique techniques
+2025-11-04 15:15:57 - ThesisRunner - INFO -   Reconnaissance: 1 unique techniques
+2025-11-04 15:15:57 - ThesisRunner - INFO -   Defense Evasion: 1 unique techniques
+2025-11-04 15:15:57 - ThesisRunner - INFO -   Initial Access: 1 unique techniques
+2025-11-04 15:15:57 - ThesisRunner - INFO - Comparing same-subnet vs cross-subnet attacks...
+2025-11-04 15:16:03 - ThesisRunner - INFO -   Cross Subnet: 1,898,613 (100.00%)
+2025-11-04 15:16:03 - ThesisRunner - INFO - Analyzing reconnaissance follow-up actions...
+2025-11-04 15:25:13 - ThesisRunner - INFO - ✓ Tactics analysis saved to thesis_results/attack_tactics_analysis.json
+2025-11-04 15:25:13 - ThesisRunner - INFO - ✓ Tactics analysis completed in 571.8s
+2025-11-04 15:25:13 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:25:13 - ThesisRunner - INFO - RUNNING QUICK PIVOT DETECTION TEST
+2025-11-04 15:25:13 - ThesisRunner - INFO - ================================================================================
+2025-11-04 15:25:13 - ThesisRunner - INFO - Configuration: dim=128, window=24h, max_events=10000
+2025-11-04 15:25:14 - ThesisRunner - ERROR - Quick test failed: {neo4j_code: Neo.ClientError.Procedure.ProcedureCallFailed} {message: Failed to invoke procedure `gds.graph.project`: Caused by: java.lang.IllegalArgumentException: Node properties not found: 'subnet_id'} {gql_status: 52N37} {gql_status_description: error: procedure exception - procedure execution error. Execution of the procedure gds.graph.project() failed.}
