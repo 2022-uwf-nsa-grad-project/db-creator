@@ -1518,37 +1518,32 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 }
             
             print(f"    ✓ Loaded features for {len(features_map)} subnets")
-            return features_map
-    
-    def get_all_pivot_behaviors(self, events: List[Dict], use_labels: bool, 
+        return features_map
+
+    def get_all_pivot_behaviors(self, events: List[Dict], use_labels: bool,
                                detection_window_hours: int):
-        """Pre-fetch ALL pivot behaviors - FIXED to detect true lateral movement."""
-        
+        """Pre-fetch all pivot behaviors for the provided events."""
+
         with self.driver.session(database=self.database) as session:
             det_window_sec = detection_window_hours * 3600
-            
-            # Get unique subnets from events and time range
+
             subnets_in_events = set(e['victim_subnet'] for e in events)
             min_time = min(e['recon_time'] for e in events)
             max_time = max(e['recon_time'] for e in events) + det_window_sec
-            
+
             print(f"    Fetching LATERAL MOVEMENT attacks for {len(subnets_in_events)} unique subnets...")
             print(f"    Time range: {min_time} to {max_time} ({(max_time - min_time) / 3600:.1f} hours)")
-            
-            # Get ONLY lateral movement attacks (cross-subnet, post-recon)
-            # OPTIMIZATION: Filter by time range in Cypher to reduce data transfer
+
             if use_labels:
-                # Label-aware: Use MITRE ATT&CK tactics that indicate lateral movement
-                # Based on exploration: dataset uses Credential Access, Defense Evasion, Exfiltration
                 query = """
                 MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
                 WHERE pivot.subnet IN $subnets
                   AND r.is_attack = 1
-                  AND r.tactic IN ['Lateral Movement', 'Execution', 'Command and Control', 
-                                   'Credential Access', 'Defense Evasion', 'Exfiltration', 
+                  AND r.tactic IN ['Lateral Movement', 'Execution', 'Command and Control',
+                                   'Credential Access', 'Defense Evasion', 'Exfiltration',
                                    'Collection', 'Discovery']
-                  AND target.subnet <> pivot.subnet  // Must be cross-subnet
-                  AND r.timestamp >= $min_time      // Filter by time range
+                  AND target.subnet <> pivot.subnet
+                  AND r.timestamp >= $min_time
                   AND r.timestamp <= $max_time
                 RETURN pivot.subnet as pivot_subnet,
                        target.subnet as target_subnet,
@@ -1556,50 +1551,39 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                        pivot.address as pivot_ip,
                        r.tactic as tactic,
                        r.technique as technique
-                ORDER BY pivot.subnet, r.timestamp
+                ORDER BY pivot_subnet, timestamp
                 """
             else:
-                # Label-agnostic: Cross-subnet connections with burst behavior
-                # (multiple connections to new subnets in short time)
                 query = """
                 MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
                 WHERE pivot.subnet IN $subnets
-                  AND target.subnet <> pivot.subnet  // Must be cross-subnet
-                  AND r.timestamp >= $min_time      // Filter by time range
+                  AND target.subnet <> pivot.subnet
+                  AND r.timestamp >= $min_time
                   AND r.timestamp <= $max_time
-                WITH pivot, target, r
-                ORDER BY r.timestamp
-                WITH pivot.subnet as pivot_subnet,
-                     target.subnet as target_subnet,
-                     collect(r.timestamp) as timestamps,
-                     collect(pivot.address) as pivot_ips,
-                     count(r) as connection_count
-                WHERE connection_count >= 3  // At least 3 connections = suspicious
-                  AND (timestamps[-1] - timestamps[0]) <= 3600  // Within 1 hour = burst
-                UNWIND range(0, size(timestamps)-1) as idx
-                RETURN pivot_subnet,
-                       target_subnet,
-                       timestamps[idx] as timestamp,
-                       pivot_ips[idx] as pivot_ip,
+                RETURN pivot.subnet as pivot_subnet,
+                       target.subnet as target_subnet,
+                       r.timestamp as timestamp,
+                       pivot.address as pivot_ip,
                        null as tactic,
                        null as technique
                 ORDER BY pivot_subnet, timestamp
                 """
-            
-            result = session.run(query, 
-                                subnets=list(subnets_in_events),
-                                min_time=min_time,
-                                max_time=max_time).data()
-            
+
+            result = session.run(
+                query,
+                subnets=list(subnets_in_events),
+                min_time=min_time,
+                max_time=max_time
+            ).data()
+
             print(f"    ✓ Fetched {len(result)} lateral movement attacks")
-            
+
             if len(result) == 0:
                 print("    ⚠ WARNING: No lateral movement attacks found!")
                 print("      All events will be classified as non-pivots.")
-            
+
             print(f"    Processing pivot behaviors in memory...")
-            
-            # Build subnet -> [(timestamp, ip, target_subnet, tactic)] mapping
+
             subnet_lateral_moves = defaultdict(list)
             for record in result:
                 subnet_lateral_moves[record['pivot_subnet']].append({
@@ -1609,42 +1593,48 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     'tactic': record.get('tactic'),
                     'technique': record.get('technique')
                 })
-            
-            # Now check each event against the lateral movements
+
             pivot_map = {}
+            min_connections = 2
+
             for event in events:
                 subnet = event['victim_subnet']
                 recon_time = event['recon_time']
-                
-                # Filter lateral movements that happened after recon_time
+
                 lateral_moves = [
                     move for move in subnet_lateral_moves.get(subnet, [])
                     if recon_time < move['timestamp'] <= recon_time + det_window_sec
                 ]
-                
-                # Get unique pivot IPs and target subnets
-                pivot_ips = list(set(move['pivot_ip'] for move in lateral_moves))[:5]
-                target_subnets = list(set(move['target_subnet'] for move in lateral_moves))[:5]
-                tactics = list(set(move['tactic'] for move in lateral_moves if move['tactic']))[:5]
-                
+
+                attack_count = len(lateral_moves)
+                pivot_ips_set = {move['pivot_ip'] for move in lateral_moves if move['pivot_ip']}
+                target_subnets_set = {move['target_subnet'] for move in lateral_moves if move['target_subnet']}
+                tactics = list({move['tactic'] for move in lateral_moves if move['tactic']})[:5]
+
+                if use_labels:
+                    became_pivot = attack_count > 0
+                else:
+                    became_pivot = attack_count >= min_connections
+                    if not became_pivot and len(target_subnets_set) >= 2:
+                        became_pivot = True
+
                 key = (subnet, recon_time)
                 pivot_map[key] = {
-                    'became_pivot': len(lateral_moves) > 0,
-                    'attack_count': len(lateral_moves),
-                    'pivot_ips': pivot_ips,
-                    'target_subnets': target_subnets,
+                    'became_pivot': became_pivot,
+                    'attack_count': attack_count,
+                    'pivot_ips': list(pivot_ips_set)[:5],
+                    'target_subnets': list(target_subnets_set)[:5],
                     'tactics': tactics
                 }
-            
-            # Count how many are actually pivots
+
             pivot_count = sum(1 for v in pivot_map.values() if v['became_pivot'])
             pivot_pct = (pivot_count / len(pivot_map) * 100) if pivot_map else 0
-            
+
             print(f"    ✓ Loaded pivot behaviors for {len(pivot_map)} events")
             print(f"    ✓ {pivot_count} ({pivot_pct:.1f}%) are TRUE PIVOTS (lateral movement detected)")
-            
+
             return pivot_map
-    
+
     def perform_statistical_analysis(self, test_df: pd.DataFrame, output_prefix: str):
         """Perform statistical significance testing."""
         print(f"\n--- Statistical Analysis ---")
