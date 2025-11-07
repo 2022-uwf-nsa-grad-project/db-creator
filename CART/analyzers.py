@@ -709,7 +709,10 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             """
             
             result = session.run(mapping_query).single()
-            print(f"  ✓ Assigned numeric IDs to {result['subnet_count']} subnets")
+            if result is None:
+                print("  ⚠ No IP nodes found while assigning subnet IDs; skipping numeric mapping.")
+            else:
+                print(f"  ✓ Assigned numeric IDs to {result['subnet_count']} subnets")
             
             # Create indices
             session.run("CREATE INDEX subnet_index IF NOT EXISTS FOR (n:IP) ON (n.subnet)")
