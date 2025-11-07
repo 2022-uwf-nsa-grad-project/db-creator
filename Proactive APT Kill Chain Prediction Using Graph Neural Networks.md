@@ -240,6 +240,50 @@ Both modes generate 100 four-hop chains, illustrating that weaponized subnets co
 - **Dormant Reconnaissance Target: 143.88.10.0/24** – Despite 1,181 reconnaissance windows, the subnet's mean similarity stays below 0.10, and no pivots occur. This validates the model's ability to suppress structurally isolated enclaves.
 - **Heuristic Inflation: 143.88.13.0/24** – In label-agnostic mode the heuristic classifies nearly all windows as pivots because bursty outbound traffic is common. Analysts should treat these scores as ranking signals and correlate them with external telemetry (e.g., SOC tickets) before automation.
 
+### **4.6 Visualization Portfolio**
+
+The visualization pipeline now exports a consistent set of artifacts to `thesis_figures/` whenever `thesis_analysis.ipynb` is executed. These figures anchor the narrative that follows.
+
+**Multi-hop network overview (`thesis_figures/hop_network_overview.png`).** Force-directed layout of subnet-to-subnet hops with pivoting subnets highlighted in red. The layout emphasizes how a handful of bridge subnets repeatedly appear as both sources and destinations of multi-hop activity.
+
+![Multi-hop network overview](thesis_figures/hop_network_overview.png)
+
+**Hop transition grid (`thesis_figures/hop_transition_grid.png`).** Small-multiple network plots for each hop depth. The grid reveals that early hops concentrate on a tight subnet core before fanning out to peripheral segments during hops three and four.
+
+![Hop transition grid](thesis_figures/hop_transition_grid.png)
+
+**Hop transition heatmap (`thesis_figures/hop_transition_heatmap.png`).** A matrix view of first-hop transitions that spotlights dominant source-to-target flows. High-intensity cells correspond to the same bridge subnets that dominate the graph view.
+
+![Hop transition heatmap](thesis_figures/hop_transition_heatmap.png)
+
+**Temporal ribbon plot (`thesis_figures/temporal_ribbon.png`).** Top reconnaissance subnets plotted through time with separate traces for pivot and non-pivot windows. The ribbon highlights how pivot volumes surge in the same 12-hour buckets where non-pivot activity collapses, signalling containment opportunities.
+
+![Temporal ribbon plot](thesis_figures/temporal_ribbon.png)
+
+**Similarity scatter comparison (`thesis_figures/similarity_scatter.png`).** Scatter plot contrasting FastRP similarity with normalized burst score for each window. Pivot windows cluster in the upper-right quadrant, demonstrating how structural and temporal signals reinforce one another.
+
+![Similarity scatter comparison](thesis_figures/similarity_scatter.png)
+
+**Cumulative pivot timeline (`thesis_figures/cumulative_pivots.png`).** Dual-axis chart with cumulative pivot detections and evolving pivot rate. The curve shows that the pivot rate remains above 90% once the first 5,000 windows are observed, validating the high-risk context.
+
+![Cumulative pivot timeline](thesis_figures/cumulative_pivots.png)
+
+**Subnet chord diagram (`thesis_figures/subnet_chord.png`).** Circular chord diagram summarizing the top 15 lateral routes. The heaviest chords connect the same trio of bridge subnets surfaced earlier, reinforcing their central role in sustaining attack chains.
+
+![Subnet chord diagram](thesis_figures/subnet_chord.png)
+
+**Effect-size forest plot (`thesis_figures/effect_size_forest.png`).** Cohen’s d values computed from pivot and non-pivot distributions across structural and temporal metrics. FastRP similarity posts the largest effect size, while normalized burst and velocity measures show smaller but still positive separation.
+
+![Effect-size forest plot](thesis_figures/effect_size_forest.png)
+
+**Window optimization heatmap (`thesis_figures/window_auc_heatmap.png`).** AUC-ROC surface for FastRP across historical and detection window combinations. The 48h/24h configuration used in the thesis sits on the ridgeline of the heatmap, confirming its near-optimal placement.
+
+![Window optimization heatmap](thesis_figures/window_auc_heatmap.png)
+
+**Structural distribution comparison (`thesis_figures/degree_distribution.png`).** Kernel density comparison of normalized subnet sizes for pivoting versus non-pivoting windows. Pivoting subnets skew toward higher relative size, underscoring the operational value of pre-emptive containment.
+
+![Structural distribution comparison](thesis_figures/degree_distribution.png)
+
 ---
 
 ## **Chapter 5: Discussion**

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import getpass
 import ipaddress
+from pathlib import Path
 from typing import Optional
 
 # Imports used by build_database helpers
@@ -168,10 +169,109 @@ class Neo4jConnection:
         if not docker_path:
             raise RuntimeError("Docker CLI not found. Please install Docker and ensure it is on your PATH.")
         self._docker_path = docker_path
-        # Sudo fallback will be handled elsewhere if daemon issues arise
-        self._use_sudo = False
-        self._sudo_password = None
         return
+
+    def _ensure_docker_access(self) -> None:
+        """Verify that Docker commands are usable, prompting for sudo when needed."""
+        if not getattr(self, "_docker_path", None):
+            self._ensure_docker_available()
+
+        test_proc = self._docker_run(["ps"], capture_output=True, check=False)
+        if test_proc.returncode == 0:
+            return
+
+        stderr = test_proc.stderr.decode().strip() if test_proc.stderr else ""
+        stdout = test_proc.stdout.decode().strip() if test_proc.stdout else ""
+        error_text = f"{stderr}\n{stdout}".strip()
+
+        if "permission denied" in error_text.lower() or "cannot connect to the docker daemon" in error_text.lower():
+            print("Docker requires elevated privileges. Switching to sudo...")
+            self._use_sudo = True
+            if not self._sudo_password:
+                self._sudo_password = getpass.getpass("Enter sudo password for Docker: ")
+            retry_proc = self._docker_run(["ps"], capture_output=True, check=False)
+            if retry_proc.returncode != 0:
+                retry_err = retry_proc.stderr.decode().strip() if retry_proc.stderr else ""
+                retry_out = retry_proc.stdout.decode().strip() if retry_proc.stdout else ""
+                raise RuntimeError(
+                    "Failed to access Docker even with sudo: "
+                    f"{(retry_err or retry_out or 'unknown error')}"
+                )
+            return
+
+        raise RuntimeError(
+            "Docker command failed: " + (error_text or f"exit code {test_proc.returncode}")
+        )
+
+    def _run_privileged_command(self, cmd, description: Optional[str] = None) -> None:
+        """Run a host command, retrying with sudo if necessary."""
+        description = description or "host command"
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode().strip() if exc.stderr else ""
+            if "operation not permitted" not in stderr.lower():
+                raise RuntimeError(f"Failed to {description}: {stderr or exc}") from exc
+        except PermissionError as exc:
+            pass
+
+        if not self._sudo_password:
+            self._sudo_password = getpass.getpass("Enter sudo password for host operations: ")
+
+        sudo_cmd = ["sudo", "-S"] + cmd
+        result = subprocess.run(
+            sudo_cmd,
+            input=(self._sudo_password + "\n").encode(),
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode().strip() if result.stderr else ""
+            raise RuntimeError(f"Failed to {description} with sudo: {stderr or result.returncode}")
+
+    def _ensure_export_directory(self, export_dir: Path) -> None:
+        """Ensure the thesis_results directory exists and is world-readable."""
+        export_dir = Path(export_dir)
+        if not export_dir.exists():
+            try:
+                export_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                self._run_privileged_command(["mkdir", "-p", str(export_dir)], "create export directory")
+
+        try:
+            current_mode = export_dir.stat().st_mode & 0o777
+        except PermissionError:
+            self._run_privileged_command(["chmod", "755", str(export_dir)], "adjust export directory permissions")
+            current_mode = export_dir.stat().st_mode & 0o777
+
+        if current_mode != 0o755:
+            try:
+                os.chmod(export_dir, 0o755)
+            except PermissionError:
+                self._run_privileged_command(["chmod", "755", str(export_dir)], "adjust export directory permissions")
+
+    def ensure_export_permissions(self, recursive: bool = True) -> None:
+        """Ensure thesis_results/ contents are readable from the host."""
+        export_dir = Path(os.path.abspath(".")) / "thesis_results"
+        try:
+            self._ensure_export_directory(export_dir)
+        except Exception as exc:
+            print(f"Warning: could not verify export directory permissions: {exc}")
+            return
+
+        chmod_cmd = ["chmod"]
+        if recursive:
+            chmod_cmd.extend(["-R", "a+rwX", str(export_dir)])
+        else:
+            chmod_cmd.extend(["755", str(export_dir)])
+
+        try:
+            subprocess.run(chmod_cmd, check=True, capture_output=True)
+        except (PermissionError, subprocess.CalledProcessError):
+            try:
+                self._run_privileged_command(chmod_cmd, "relax export directory permissions")
+            except Exception as exc:
+                print(f"Warning: could not adjust export directory permissions: {exc}")
 
     def _docker_run(self, args, **kwargs):
         """Run a docker command with resolved executable path."""
@@ -237,6 +337,7 @@ class Neo4jConnection:
         If tail is provided, will pass --tail <n> to docker logs when supported.
         """
         try:
+            self._ensure_docker_access()
             args = ["logs", self.container_name]
             if tail is not None:
                 args.extend(["--tail", str(tail)])
@@ -251,6 +352,7 @@ class Neo4jConnection:
         Example output: '0.0.0.0:7474->7474/tcp, 0.0.0.0:7687->7687/tcp'
         """
         try:
+            self._ensure_docker_access()
             out = self._docker_check_output([
                 "ps", "--filter", f"name=^{self.container_name}$", "--format", "{{.Ports}}"
             ], stderr=subprocess.STDOUT)
@@ -301,6 +403,7 @@ class Neo4jConnection:
     def _container_exists(self) -> bool:
         """Return True if a container with self.container_name exists (any state)."""
         try:
+            self._ensure_docker_access()
             # Use exact-name filter to find container ID by name (safer than partial matches)
             cmd = ["ps", "-aq", "--filter", f"name=^{self.container_name}$"]
             res = self._docker_run(cmd, capture_output=True, check=False)
@@ -319,6 +422,7 @@ class Neo4jConnection:
     def _is_container_running(self) -> Optional[bool]:
         """Return True if container is running, False if not running, None if unknown."""
         try:
+            self._ensure_docker_access()
             # Check running state by filtering running containers by exact name
             cmd = ["ps", "-q", "--filter", f"name=^{self.container_name}$"]
             out = self._docker_check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
@@ -335,6 +439,7 @@ class Neo4jConnection:
     def _cleanup_existing_containers(self):
         """Stop and remove any existing Neo4j containers."""
         try:
+            self._ensure_docker_access()
             # Find existing containers (by image)
             cmd = ["ps", "-a", "-q", "--filter", f"ancestor={self.neo4j_image}"]
             containers = self._docker_check_output(cmd).decode().strip()
@@ -378,23 +483,7 @@ class Neo4jConnection:
             return False
 
         # Ensure Docker is installed and usable
-        try:
-            self._ensure_docker_available()
-        except RuntimeError:
-            raise
-
-        # Test if we need sudo by trying a simple docker command
-        try:
-            test_proc = self._docker_run(["version"], capture_output=True, check=False)
-            if test_proc.returncode != 0:
-                stderr = test_proc.stderr.decode().strip() if test_proc.stderr else ""
-                if "permission denied" in stderr.lower():
-                    print("Docker requires sudo privileges.")
-                    sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
-                    self._use_sudo = True
-                    self._sudo_password = sudo_pw
-        except Exception:
-            pass
+        self._ensure_docker_access()
 
         # If a container with the desired name is already running and exposes
         # the standard HTTP port (7474), don't start a second container.
@@ -414,47 +503,68 @@ class Neo4jConnection:
         try:
             cmd_check = ["images", "-q", self.neo4j_image]
             proc = self._docker_run(cmd_check, capture_output=True, check=False)
-            image_id = proc.stdout.decode().strip()
-            if not image_id:
-                print(f"Docker image '{self.neo4j_image}' not found locally. Pulling...")
-                pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
-                if pull_proc.returncode != 0:
-                    stderr = pull_proc.stderr.decode().strip()
-                    print(f"Failed to pull image '{self.neo4j_image}': {stderr}")
-                    # Check for permission denied
-                    if "permission denied" in stderr.lower():
+            permission_denied = False
+            last_error = ""
+
+            if proc.returncode != 0:
+                last_error = proc.stderr.decode().strip() if proc.stderr else ""
+                if "permission denied" in last_error.lower():
+                    permission_denied = True
+                    if not self._use_sudo:
                         print("Permission denied when accessing Docker daemon. Sudo is required.")
                         sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
                         self._use_sudo = True
                         self._sudo_password = sudo_pw
-                        # Retry the pull with sudo
+                else:
+                    raise RuntimeError(f"Docker error while listing images: {last_error}")
+
+            image_id = proc.stdout.decode().strip() if proc.stdout else ""
+            if not image_id and proc.returncode == 0:
+                print(f"Docker image '{self.neo4j_image}' not found locally. Pulling...")
+                pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
+                if pull_proc.returncode != 0:
+                    last_error = pull_proc.stderr.decode().strip() if pull_proc.stderr else ""
+                    print(f"Failed to pull image '{self.neo4j_image}': {last_error}")
+                    if "permission denied" in last_error.lower():
+                        permission_denied = True
+                        if not self._use_sudo:
+                            print("Permission denied when accessing Docker daemon. Sudo is required.")
+                            sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
+                            self._use_sudo = True
+                            self._sudo_password = sudo_pw
                         pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
                         if pull_proc.returncode != 0:
-                            print(f"Failed to pull image with sudo: {pull_proc.stderr.decode().strip()}")
+                            err = pull_proc.stderr.decode().strip() if pull_proc.stderr else ""
+                            print(f"Failed to pull image with sudo: {err}")
                             return False
+                        print(f"Successfully pulled '{self.neo4j_image}' with sudo.")
                     else:
-                        return False
-                print(f"Successfully pulled '{self.neo4j_image}'.")
-            else:
-                print(f"Docker image '{self.neo4j_image}' found locally: {image_id}")
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode().strip() if e.stderr else str(e)
-            # Check for permission denied in the exception
-            if "permission denied" in stderr.lower():
-                print("Permission denied when accessing Docker daemon. Sudo is required.")
-                sudo_pw = getpass.getpass("Enter sudo password for Docker: ")
-                self._use_sudo = True
-                self._sudo_password = sudo_pw
-                # Retry checking for image with sudo
+                        raise RuntimeError(f"Failed to pull image '{self.neo4j_image}': {last_error}")
+                else:
+                    print(f"Successfully pulled '{self.neo4j_image}'.")
+
+            # Start new container using Path
+            export_dir = Path(os.path.abspath(".")) / "thesis_results"
+            try:
+                self._ensure_export_directory(export_dir)
+            except Exception as exc:
+                print(f"Warning: could not prepare local export directory '{export_dir}': {exc}")
+
+            if permission_denied:
+                print("Retrying Docker image lookup with elevated privileges...")
                 try:
                     cmd_check = ["images", "-q", self.neo4j_image]
                     proc = self._docker_run(cmd_check, capture_output=True, check=False)
+                    if proc.returncode != 0:
+                        err = proc.stderr.decode().strip() if proc.stderr else ""
+                        raise RuntimeError(f"Docker error after sudo retry: {err}")
                     image_id = proc.stdout.decode().strip()
                     if not image_id:
-                        print(f"Docker image '{self.neo4j_image}' not found locally. Pulling...")
+                        print(f"Docker image '{self.neo4j_image}' not found locally after sudo retry. Pulling...")
                         pull_proc = self._docker_run(["pull", self.neo4j_image], capture_output=True)
                         if pull_proc.returncode != 0:
-                            print(f"Failed to pull image with sudo: {pull_proc.stderr.decode().strip()}")
+                            err = pull_proc.stderr.decode().strip() if pull_proc.stderr else ""
+                            print(f"Failed to pull image with sudo: {err}")
                             return False
                         print(f"Successfully pulled '{self.neo4j_image}'.")
                     else:
@@ -462,8 +572,6 @@ class Neo4jConnection:
                 except Exception as e2:
                     print(f"Failed after sudo retry: {e2}")
                     return False
-            else:
-                raise RuntimeError(f"Docker error: {stderr}")
         except FileNotFoundError:
             raise RuntimeError("Docker CLI not found. Please install Docker or ensure 'docker' is on PATH.")
 
@@ -475,6 +583,15 @@ class Neo4jConnection:
             return False
 
         # Start new container
+        export_dir = os.path.join(os.path.abspath("."), "thesis_results")
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            current_mode = os.stat(export_dir).st_mode & 0o777
+            if current_mode != 0o755:
+                os.chmod(export_dir, 0o755)
+        except PermissionError as exc:
+            print(f"Warning: could not prepare local export directory '{export_dir}': {exc}")
+
         print(f"Launching new Neo4j container: '{self.container_name}' with GDS Plugin...")
         try:
             cmd = [
@@ -482,10 +599,16 @@ class Neo4jConnection:
                 "--name", self.container_name,
                 "-p", f"{self.http_port}:7474",
                 "-p", f"{self.bolt_port}:7687",
+                "-v", f"{export_dir}:/var/lib/neo4j/import/thesis_results",
                 "-e", f"NEO4J_AUTH={self.user}/{self.password}",
-                "-e", 'NEO4J_PLUGINS=["graph-data-science"]',
-                "--env", f"NEO4J_dbms_memory_heap_initial__size={self.heap_initial}",
-                "--env", f"NEO4J_dbms_memory_heap_max__size={self.heap_max}",
+                "-e", "NEO4J_ACCEPT_LICENSE_AGREEMENT=yes",
+                "-e", "NEO4J_PLUGINS=[\"apoc\", \"graph-data-science\"]",
+                "-e", "NEO4J_dbms_security_procedures_allowlist=apoc.*,gds.*",
+                "-e", "NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*",
+                "-e", "NEO4J_apoc_export_file_enabled=true",
+                "-e", "NEO4J_apoc_import_file_enabled=true",
+                "-e", f"NEO4J_dbms_memory_heap_initial__size={self.heap_initial}",
+                "-e", f"NEO4J_dbms_memory_heap_max__size={self.heap_max}",
                 self.neo4j_image
             ]
             result = self._docker_run(cmd, check=False, capture_output=True)
@@ -503,6 +626,20 @@ class Neo4jConnection:
             print(f"FATAL ERROR: Exception when starting Neo4j container: {e}")
             return False
 
+        try:
+            fix_perm = self._docker_run([
+                "exec", self.container_name,
+                "chmod", "755", "/var/lib/neo4j/import/thesis_results"
+            ], capture_output=True, check=False)
+            if fix_perm.returncode != 0:
+                stderr = fix_perm.stderr.decode().strip() if fix_perm.stderr else ""
+                print(
+                    "Warning: failed to relax permissions on export directory inside container: "
+                    f"{stderr}"
+                )
+        except Exception as exc:
+            print(f"Warning: could not adjust export directory permissions: {exc}")
+
         print("Waiting for Neo4j Bolt to become available (this may take up to 2 minutes)...")
         # Wait and verify connectivity (longer timeout than fixed sleep)
         if not self._wait_for_bolt(timeout=120, interval=3):
@@ -515,6 +652,9 @@ class Neo4jConnection:
         print(f"   - **Access Browser at:** http://localhost:{self.http_port}")
         print("=" * 58)
         
+        # Ensure the mounted export directory remains readable on the host
+        self.ensure_export_permissions(recursive=True)
+
         return True
 
     def stop(self) -> bool:
@@ -524,6 +664,12 @@ class Neo4jConnection:
         Returns:
             bool: True if container stopped successfully, False otherwise
         """
+        try:
+            self._ensure_docker_access()
+        except RuntimeError as exc:
+            print(f"Failed to access Docker when stopping container: {exc}")
+            return False
+
         # If the container doesn't exist, consider it stopped
         exists = self._container_exists()
         if not exists:
@@ -555,6 +701,11 @@ class Neo4jConnection:
         """
         # If the container is running, stop it first (cleaner than force-remove)
         exists = self._container_exists()
+        try:
+            self._ensure_docker_access()
+        except RuntimeError as exc:
+            print(f"Failed to access Docker when removing container: {exc}")
+            return False
         if not exists:
             print(f"Container '{self.container_name}' does not exist; nothing to remove.")
             return True
@@ -700,7 +851,7 @@ class Neo4jConnection:
                     print("DataFrame is empty. No data to write.")
                     return # Nothing else to do
 
-                batch_size = 25000  # Optimal batch size for Neo4j
+                batch_size = 15000  # Optimal batch size for Neo4j
                 
                 print(f"\nWriting {total_rows:,} rows in batches of {batch_size:,}...")
                 

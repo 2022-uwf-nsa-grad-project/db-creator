@@ -1781,6 +1781,10 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                   AND r3.timestamp > r2.timestamp
                   AND a <> c AND b <> d AND a <> d
                 WITH 
+                    a.address as hop1_ip,
+                    b.address as hop2_ip,
+                    c.address as hop3_ip,
+                    d.address as hop4_ip,
                     a.subnet as hop1_subnet,
                     b.subnet as hop2_subnet,
                     c.subnet as hop3_subnet,
@@ -1791,8 +1795,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     r1.tactic as tactic1,
                     r2.tactic as tactic2,
                     r3.tactic as tactic3
-                LIMIT 100
                 RETURN 
+                    hop1_ip, hop2_ip, hop3_ip, hop4_ip,
                     hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
                     (t2 - t1) / 3600.0 as hours_to_hop2,
                     (t3 - t2) / 3600.0 as hours_to_hop3,
@@ -1805,6 +1809,10 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                   AND r3.timestamp > r2.timestamp
                   AND a <> c AND b <> d AND a <> d
                 WITH 
+                    a.address as hop1_ip,
+                    b.address as hop2_ip,
+                    c.address as hop3_ip,
+                    d.address as hop4_ip,
                     a.subnet as hop1_subnet,
                     b.subnet as hop2_subnet,
                     c.subnet as hop3_subnet,
@@ -1812,8 +1820,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     r1.timestamp as t1,
                     r2.timestamp as t2,
                     r3.timestamp as t3
-                LIMIT 100
                 RETURN 
+                    hop1_ip, hop2_ip, hop3_ip, hop4_ip,
                     hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
                     (t2 - t1) / 3600.0 as hours_to_hop2,
                     (t3 - t2) / 3600.0 as hours_to_hop3
