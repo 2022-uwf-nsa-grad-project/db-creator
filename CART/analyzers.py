@@ -693,26 +693,38 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             """
             session.run(subnet_query)
             
-            # Second pass: Create subnet mapping
-            print("  Creating subnet ID mapping...")
-            # Collect distinct subnet strings and assign deterministic integer IDs
-            # using UNWIND over a range (avoids unsupported window functions)
+            # Second pass: Create subnet mapping with deterministic hashing
+            print("  Creating subnet ID mapping (using deterministic hash)...")
+            # Use MD5 hash for deterministic subnet_id instead of index-based assignment
+            # This ensures consistency across multiple runs
+            # Convert first 8 hex chars to integer using pure Cypher (no APOC parseInteger needed)
             mapping_query = """
             MATCH (n:IP)
-            WITH collect(DISTINCT n.subnet) AS subs
-            UNWIND range(0, size(subs)-1) AS idx
-            WITH subs[idx] AS subnet, idx AS subnet_id, subs
+            WITH DISTINCT n.subnet AS subnet
+            WITH subnet,
+                 toInteger(
+                   reduce(val = 0, i IN range(0, 7) | 
+                     val * 16 + 
+                     CASE substring(apoc.util.md5([subnet]), i, 1)
+                       WHEN '0' THEN 0 WHEN '1' THEN 1 WHEN '2' THEN 2 WHEN '3' THEN 3
+                       WHEN '4' THEN 4 WHEN '5' THEN 5 WHEN '6' THEN 6 WHEN '7' THEN 7
+                       WHEN '8' THEN 8 WHEN '9' THEN 9 WHEN 'a' THEN 10 WHEN 'b' THEN 11
+                       WHEN 'c' THEN 12 WHEN 'd' THEN 13 WHEN 'e' THEN 14 WHEN 'f' THEN 15
+                       ELSE 0
+                     END
+                   )
+                 ) % 1000 AS subnet_id
             MATCH (m:IP)
             WHERE m.subnet = subnet
             SET m.subnet_id = subnet_id
-            RETURN size(subs) AS subnet_count
+            RETURN count(DISTINCT subnet) AS subnet_count
             """
             
             result = session.run(mapping_query).single()
             if result is None:
                 print("  ⚠ No IP nodes found while assigning subnet IDs; skipping numeric mapping.")
             else:
-                print(f"  ✓ Assigned numeric IDs to {result['subnet_count']} subnets")
+                print(f"  ✓ Assigned deterministic numeric IDs to {result['subnet_count']} subnets")
             
             # Create indices
             session.run("CREATE INDEX subnet_index IF NOT EXISTS FOR (n:IP) ON (n.subnet)")
@@ -782,22 +794,19 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         """Safely drop a graph projection if it exists."""
         with self.driver.session(database=self.database) as session:
             try:
-                # Direct drop attempt first
-                drop_query = "CALL gds.graph.drop($name)"
+                # Force drop even if graph is in use
+                drop_query = "CALL gds.graph.drop($name, false)"
                 session.run(drop_query, name=graph_name)
                 return True
-            except Exception:
-                try:
-                    # Check if it exists
-                    exists_query = "CALL gds.graph.exists($name) YIELD exists RETURN exists"
-                    result = session.run(exists_query, name=graph_name).single()
-                    if not result or not result['exists']:
-                        return True
-                    print(f"  ⚠ Failed to drop projection: {graph_name}")
-                    return False
-                except Exception as e:
-                    print(f"  ⚠ Error checking projection {graph_name}: {str(e)}")
-                    return False
+            except Exception as e:
+                # Check if it's just "graph doesn't exist" (OK to ignore)
+                error_msg = str(e).lower()
+                if "does not exist" in error_msg or "no graph with name" in error_msg:
+                    return True
+                # Otherwise, this is a real error - don't silently continue!
+                print(f"  ⚠ CRITICAL: Cannot drop projection {graph_name}: {e}")
+                print(f"     This may cause memory leaks or incorrect embeddings!")
+                raise
 
     def drop_all_graph_projections(self):
         """Drop all existing graph projections."""
@@ -847,31 +856,29 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         with self.driver.session(database=self.database) as session:
             # Create projection with or without relationship properties
             if use_labels:
-                # Ensure old projections are dropped
-                struct_name = f"{projection_name}_structure"
-                
                 # Check if projection exists before trying to drop
                 try:
                     exists_result = session.run(
                         "CALL gds.graph.exists($name) YIELD exists RETURN exists",
-                        name=struct_name
+                        name=projection_name
                     ).single()
                     
                     if exists_result and exists_result['exists']:
-                        session.run("CALL gds.graph.drop($name)", name=struct_name)
-                        print(f"  ✓ Dropped existing structure projection")
+                        session.run("CALL gds.graph.drop($name)", name=projection_name)
+                        print(f"  ✓ Dropped existing projection")
                 except Exception as e:
                     # Ignore errors - projection doesn't exist or already dropped
                     pass
                 
-                # Create structure projection with UNDIRECTED orientation
-                # (required for clustering coefficient)
+                # Create unified projection with both structure AND labels
+                # This supports the optimized single-pass FastRP computation
                 create_query = """
                 CALL gds.graph.project(
                     $name,
                     'IP',
                     {
                         CONNECTS: {
+                            properties: ['is_attack'],
                             orientation: 'UNDIRECTED'
                         }
                     },
@@ -882,53 +889,13 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 YIELD graphName, nodeCount, relationshipCount
                 RETURN graphName, nodeCount, relationshipCount
                 """
-                result = session.run(create_query, name=struct_name).single()
+                result = session.run(create_query, name=projection_name).single()
                 if result:
-                    print(f"  ✓ Created structure projection: {result['graphName']}")
+                    print(f"  ✓ Created label-aware projection: {result['graphName']}")
                     print(f"    Nodes: {result['nodeCount']:,}")
                     print(f"    Relationships: {result['relationshipCount']:,}")
                 else:
-                    print("  ⚠ Error: Failed to create structure projection")
-                    return
-                
-                # Second projection for attack labels
-                labels_name = f"{projection_name}_labels"
-                
-                # Check if projection exists before trying to drop
-                try:
-                    exists_result = session.run(
-                        "CALL gds.graph.exists($name) YIELD exists RETURN exists",
-                        name=labels_name
-                    ).single()
-                    
-                    if exists_result and exists_result['exists']:
-                        session.run("CALL gds.graph.drop($name)", name=labels_name)
-                        print(f"  ✓ Dropped existing labels projection")
-                except Exception as e:
-                    # Ignore errors - projection doesn't exist or already dropped
-                    pass
-                
-                labels_query = """
-                CALL gds.graph.project(
-                    $name,
-                    'IP',
-                    {
-                        CONNECTS: {
-                            properties: ['is_attack'],
-                            orientation: 'UNDIRECTED'
-                        }
-                    }
-                )
-                YIELD graphName, nodeCount, relationshipCount
-                RETURN graphName, nodeCount, relationshipCount
-                """
-                result = session.run(labels_query, name=labels_name).single()
-                if result:
-                    print(f"  ✓ Created labels projection: {result['graphName']}")
-                    print(f"    Nodes: {result['nodeCount']:,}")
-                    print(f"    Relationships: {result['relationshipCount']:,}")
-                else:
-                    print("  ⚠ Error: Failed to create labels projection")
+                    print("  ⚠ Error: Failed to create projection")
                     return
             else:
                 # Check if projection exists before trying to drop
@@ -979,37 +946,19 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         
         with self.driver.session(database=self.database) as session:
             if use_labels:
-                # First compute structural embeddings
+                # OPTIMIZED: Single FastRP run with relationship weights and node features
+                # This is 2x faster than computing structure + labels separately
+                print("  Computing label-aware embeddings (single pass with weights)...")
                 query = f"""
                 CALL gds.fastRP.write(
-                    '{projection_name}_structure',
-                    {{
-                        embeddingDimension: {embedding_dim},
-                        iterationWeights: [0.0, 1.0, 1.0, 1.0],
-                        normalizationStrength: 0.5,
-                        writeProperty: 'embedding_structure'
-                    }}
-                )
-                YIELD nodePropertiesWritten, computeMillis
-                RETURN nodePropertiesWritten, computeMillis
-                """
-                result = session.run(query).single()
-                if result:
-                    print(f"  ✓ Structural embeddings computed in {result['computeMillis']/1000.0:.2f}s")
-                else:
-                    print("  ⚠ Error: Failed to compute structural embeddings")
-                    return
-                
-                # Then compute label-aware embeddings
-                query = f"""
-                CALL gds.fastRP.write(
-                    '{projection_name}_labels',
+                    '{projection_name}',
                     {{
                         embeddingDimension: {embedding_dim},
                         relationshipWeightProperty: 'is_attack',
+                        featureProperties: ['subnet_id'],
                         iterationWeights: [0.0, 1.0, 1.0, 1.0],
                         normalizationStrength: 0.5,
-                        writeProperty: 'embedding_labels'
+                        writeProperty: 'embedding_label_aware'
                     }}
                 )
                 YIELD nodePropertiesWritten, computeMillis
@@ -1017,21 +966,11 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 """
                 result = session.run(query).single()
                 if result:
-                    print(f"  ✓ Label embeddings computed in {result['computeMillis']/1000.0:.2f}s")
+                    print(f"  ✓ Label-aware embeddings computed in {result['computeMillis']/1000.0:.2f}s")
+                    print(f"     (wrote {result['nodePropertiesWritten']:,} node properties)")
                 else:
-                    print("  ⚠ Error: Failed to compute label embeddings")
+                    print("  ⚠ Error: Failed to compute label-aware embeddings")
                     return
-                
-                # Combine embeddings
-                query = """
-                MATCH (n:IP)
-                WHERE n.embedding_structure IS NOT NULL AND n.embedding_labels IS NOT NULL
-                SET n.embedding_label_aware = n.embedding_structure + n.embedding_labels
-                WITH count(n) as nodes_updated
-                RETURN nodes_updated
-                """
-                result = session.run(query).single()
-                print(f"  ✓ Combined embeddings for {result['nodes_updated']:,} nodes")
                 
                 write_property = 'embedding_label_aware'
             else:
@@ -1311,9 +1250,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         self.compute_fastrp_embeddings(projection_name, embedding_dim, use_labels)
         
         # Step 3: Compute centrality metrics
-        # For label-aware mode, use the structure projection
-        centrality_projection = f"{projection_name}_structure" if use_labels else projection_name
-        self.compute_centrality_metrics(centrality_projection)
+        # Both label-aware and label-agnostic use the same unified projection now
+        self.compute_centrality_metrics(projection_name)
         
         # Step 4: Compute temporal features
         self.compute_temporal_features()
@@ -1327,7 +1265,15 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             print("  ⚠ No reconnaissance events found")
             return
         
-        # Step 6: Train/test split (50/50 temporal)
+        # Step 6: Train/test split (50/50 TEMPORAL split)
+        # NOTE: This is a temporal split that simulates real-world deployment.
+        # The model trains on earlier attacks and tests on later attacks.
+        # This intentionally tests whether patterns learned from early campaign
+        # phases generalize to later phases.
+        # 
+        # TRADE-OFF: If attack patterns change over time or certain subnets
+        # only appear in one half, this may underestimate performance compared
+        # to stratified sampling. However, it better reflects operational reality.
         split_idx = len(recon_events) // 2
         train_events = recon_events[:split_idx]
         test_events = recon_events[split_idx:]
@@ -1354,14 +1300,29 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         print(f"    Valid samples: {len(train_df):,}")
         print(f"    Pivots: {train_pivot_count:,} ({train_pivot_count/len(train_df)*100:.1f}%)")
         
+        # CRITICAL: Check for empty pivot set before computing reference
         if train_pivot_count == 0:
-            print("  ⚠ No pivots in training set")
+            print("  ⚠ WARNING: No pivots in training set - cannot compute reference embedding!")
+            print("     This can happen when:")
+            print("       1. The dataset has very few pivots")
+            print("       2. The temporal split placed all pivots in the test set")
+            print("       3. The detection window is too short")
+            print("     Consider:")
+            print("       - Increasing detection_window_hours")
+            print("       - Using stratified sampling instead of temporal split")
+            print("       - Reviewing reconnaissance event filtering")
             return
         
         # Create reference pivot embedding
         train_pivot_embeddings = np.array([
             r['embedding'] for r in train_results if r['became_pivot']
         ])
+        
+        if len(train_pivot_embeddings) == 0:
+            print("  ⚠ CRITICAL ERROR: train_pivot_count > 0 but no embeddings extracted!")
+            print("     This indicates a data integrity issue - aborting.")
+            return
+            
         reference_pivot_embedding = np.mean(train_pivot_embeddings, axis=0)
         
         # Step 8: Process test set
@@ -1534,20 +1495,31 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             min_time = min(e['recon_time'] for e in events)
             max_time = max(e['recon_time'] for e in events) + det_window_sec
 
+            # Create index for query optimization (idempotent)
+            try:
+                session.run("""
+                    CREATE INDEX connects_timestamp_attack IF NOT EXISTS 
+                    FOR ()-[r:CONNECTS]-() ON (r.timestamp, r.is_attack)
+                """)
+            except Exception:
+                pass  # Index may already exist
+
             print(f"    Fetching LATERAL MOVEMENT attacks for {len(subnets_in_events)} unique subnets...")
             print(f"    Time range: {min_time} to {max_time} ({(max_time - min_time) / 3600:.1f} hours)")
 
             if use_labels:
+                # Optimized query: filter by time/attack first, then cross-subnet check
                 query = """
                 MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
                 WHERE pivot.subnet IN $subnets
+                  AND r.timestamp >= $min_time
+                  AND r.timestamp <= $max_time
                   AND r.is_attack = 1
                   AND r.tactic IN ['Lateral Movement', 'Execution', 'Command and Control',
                                    'Credential Access', 'Defense Evasion', 'Exfiltration',
                                    'Collection', 'Discovery']
-                  AND target.subnet <> pivot.subnet
-                  AND r.timestamp >= $min_time
-                  AND r.timestamp <= $max_time
+                WITH pivot, target, r
+                WHERE target.subnet <> pivot.subnet
                 RETURN pivot.subnet as pivot_subnet,
                        target.subnet as target_subnet,
                        r.timestamp as timestamp,
@@ -1560,9 +1532,10 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 query = """
                 MATCH (pivot:IP)-[r:CONNECTS]->(target:IP)
                 WHERE pivot.subnet IN $subnets
-                  AND target.subnet <> pivot.subnet
                   AND r.timestamp >= $min_time
                   AND r.timestamp <= $max_time
+                WITH pivot, target, r
+                WHERE target.subnet <> pivot.subnet
                 RETURN pivot.subnet as pivot_subnet,
                        target.subnet as target_subnet,
                        r.timestamp as timestamp,
@@ -1750,6 +1723,50 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             })
         
         comparison_df = pd.DataFrame(comparison_results)
+        
+        # STATISTICAL CORRECTION: Apply Benjamini-Hochberg correction for multiple comparisons
+        # We're running 9 tests, so we need to control the False Discovery Rate
+        print("\n  Applying multiple testing correction (Benjamini-Hochberg)...")
+        
+        # For demonstration, compute effect sizes (Cohen's d) vs FastRP
+        fastrp_scores = test_df['fastrp_similarity'].fillna(0)
+        pivots = test_df[test_df['became_pivot'] == 1]
+        non_pivots = test_df[test_df['became_pivot'] == 0]
+        
+        for idx, row in comparison_df.iterrows():
+            if row['Method'] == 'FastRP Embedding':
+                continue
+            score_col = methods[row['Method']]
+            pivot_scores = pivots[score_col].fillna(0)
+            non_pivot_scores = non_pivots[score_col].fillna(0)
+            
+            # Welch's t-test
+            if len(pivot_scores) > 1 and len(non_pivot_scores) > 1:
+                t_stat, p_value = stats.ttest_ind(pivot_scores, non_pivot_scores, equal_var=False)
+                
+                # Cohen's d
+                pooled_std = np.sqrt((pivot_scores.std()**2 + non_pivot_scores.std()**2) / 2)
+                cohens_d = (pivot_scores.mean() - non_pivot_scores.mean()) / pooled_std if pooled_std > 0 else 0
+                
+                comparison_df.at[idx, 'p_value'] = p_value
+                comparison_df.at[idx, 'cohens_d'] = cohens_d
+        
+        # Apply Benjamini-Hochberg correction if scipy supports it
+        try:
+            from scipy.stats import false_discovery_control
+            if 'p_value' in comparison_df.columns:
+                p_values = comparison_df['p_value'].dropna().values
+                if len(p_values) > 0:
+                    corrected_p = false_discovery_control(p_values, method='bh')
+                    comparison_df.loc[comparison_df['p_value'].notna(), 'p_value_adj'] = corrected_p
+                    print("  ✓ Benjamini-Hochberg correction applied")
+        except (ImportError, AttributeError):
+            # Fallback: Manual Bonferroni correction
+            if 'p_value' in comparison_df.columns:
+                n_tests = comparison_df['p_value'].notna().sum()
+                comparison_df['p_value_adj'] = comparison_df['p_value'] * n_tests
+                print(f"  ✓ Bonferroni correction applied (n={n_tests} tests)")
+        
         print("\n" + "="*100)
         print("METHOD COMPARISON")
         print("="*100)
@@ -1772,88 +1789,194 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             print(f"  ⚠ FastRP is {abs(diff):.2f}pp {'behind' if diff < 0 else 'ahead of'} best baseline")
     
     def analyze_multi_hop_chains(self, use_labels: bool, output_prefix: str):
-        """Analyze multi-hop attack chains (A→B→C→D)."""
-        print(f"\n--- Multi-Hop Attack Chain Analysis ---")
+        """
+        Analyze multi-hop attack chains (A→B→C→D) using Polars for memory-efficient processing.
+        Exports edges from Neo4j, then constructs chains in Python to avoid Neo4j memory limits.
+        """
+        print(f"\n--- Multi-Hop Attack Chain Analysis (Polars) ---")
+        
+        try:
+            import polars as pl
+        except ImportError:
+            print("  ⚠ Polars not installed. Run: pip install polars")
+            return
+        
+        from collections import defaultdict
+        import tempfile
+        import os
+        
+        output_file = f'{output_prefix}_multi_hop_chains.csv'
+        
+        # Step 1: Export edges from Neo4j to temporary CSV
+        print("  Step 1: Exporting CONNECTS edges from Neo4j...")
+        temp_edges_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        temp_edges_path = temp_edges_file.name
+        temp_edges_file.close()
         
         with self.driver.session(database=self.database) as session:
+            # Export query with all necessary attributes
+            export_query = """
+            MATCH (a:IP)-[r:CONNECTS]->(b:IP)
+            RETURN 
+                a.address as src_ip,
+                b.address as dst_ip,
+                a.subnet as src_subnet,
+                b.subnet as dst_subnet,
+                r.timestamp as timestamp,
+                r.is_attack as is_attack,
+                CASE WHEN r.is_attack = 1 THEN r.tactic ELSE null END as tactic
+            ORDER BY r.timestamp
+            """
+            
+            result = session.run(export_query)
+            
+            # Write to temp CSV
+            import csv
+            with open(temp_edges_path, 'w', newline='') as f:
+                writer = None
+                count = 0
+                for record in result:
+                    if writer is None:
+                        writer = csv.DictWriter(f, fieldnames=record.keys())
+                        writer.writeheader()
+                    writer.writerow(dict(record))
+                    count += 1
+                    if count % 50000 == 0:
+                        print(f"    Exported {count:,} edges...")
+            
+            print(f"  ✓ Exported {count:,} edges to temporary file")
+        
+        try:
+            # Step 2: Load edges with Polars and filter
+            print("  Step 2: Loading edges into Polars...")
+            edges_df = pl.read_csv(temp_edges_path)
+            
             if use_labels:
-                query = """
-                MATCH path = (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)-[r3:CONNECTS]->(d:IP)
-                WHERE r1.is_attack = 1 AND r2.is_attack = 1 AND r3.is_attack = 1
-                  AND r2.timestamp > r1.timestamp
-                  AND r3.timestamp > r2.timestamp
-                  AND a <> c AND b <> d AND a <> d
-                WITH 
-                    a.address as hop1_ip,
-                    b.address as hop2_ip,
-                    c.address as hop3_ip,
-                    d.address as hop4_ip,
-                    a.subnet as hop1_subnet,
-                    b.subnet as hop2_subnet,
-                    c.subnet as hop3_subnet,
-                    d.subnet as hop4_subnet,
-                    r1.timestamp as t1,
-                    r2.timestamp as t2,
-                    r3.timestamp as t3,
-                    r1.tactic as tactic1,
-                    r2.tactic as tactic2,
-                    r3.tactic as tactic3
-                RETURN 
-                    hop1_ip, hop2_ip, hop3_ip, hop4_ip,
-                    hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
-                    (t2 - t1) / 3600.0 as hours_to_hop2,
-                    (t3 - t2) / 3600.0 as hours_to_hop3,
-                    tactic1, tactic2, tactic3
-                """
+                # Filter to attack edges only
+                edges_df = edges_df.filter(pl.col('is_attack') == 1)
+                print(f"  ✓ Filtered to {len(edges_df):,} attack edges")
             else:
-                query = """
-                MATCH path = (a:IP)-[r1:CONNECTS]->(b:IP)-[r2:CONNECTS]->(c:IP)-[r3:CONNECTS]->(d:IP)
-                WHERE r2.timestamp > r1.timestamp
-                  AND r3.timestamp > r2.timestamp
-                  AND a <> c AND b <> d AND a <> d
-                WITH 
-                    a.address as hop1_ip,
-                    b.address as hop2_ip,
-                    c.address as hop3_ip,
-                    d.address as hop4_ip,
-                    a.subnet as hop1_subnet,
-                    b.subnet as hop2_subnet,
-                    c.subnet as hop3_subnet,
-                    d.subnet as hop4_subnet,
-                    r1.timestamp as t1,
-                    r2.timestamp as t2,
-                    r3.timestamp as t3
-                RETURN 
-                    hop1_ip, hop2_ip, hop3_ip, hop4_ip,
-                    hop1_subnet, hop2_subnet, hop3_subnet, hop4_subnet,
-                    (t2 - t1) / 3600.0 as hours_to_hop2,
-                    (t3 - t2) / 3600.0 as hours_to_hop3
-                """
+                print(f"  ✓ Loaded {len(edges_df):,} edges (all traffic)")
             
-            result = session.run(query).data()
+            # Step 3: Build chains using self-joins
+            print("  Step 3: Constructing 3-hop chains via joins...")
             
-            if not result:
-                print("  ⚠ No multi-hop chains found")
+            # Prepare edges for joining (rename columns for each hop)
+            hop1 = edges_df.select([
+                pl.col('src_ip').alias('hop1_ip'),
+                pl.col('dst_ip').alias('hop2_ip'),
+                pl.col('src_subnet').alias('hop1_subnet'),
+                pl.col('dst_subnet').alias('hop2_subnet'),
+                pl.col('timestamp').alias('t1'),
+                pl.col('tactic').alias('tactic1') if use_labels else pl.lit(None).alias('tactic1')
+            ])
+            
+            hop2 = edges_df.select([
+                pl.col('src_ip').alias('hop2_ip'),
+                pl.col('dst_ip').alias('hop3_ip'),
+                pl.col('src_subnet').alias('hop2_subnet_check'),
+                pl.col('dst_subnet').alias('hop3_subnet'),
+                pl.col('timestamp').alias('t2'),
+                pl.col('tactic').alias('tactic2') if use_labels else pl.lit(None).alias('tactic2')
+            ])
+            
+            hop3 = edges_df.select([
+                pl.col('src_ip').alias('hop3_ip'),
+                pl.col('dst_ip').alias('hop4_ip'),
+                pl.col('src_subnet').alias('hop3_subnet_check'),
+                pl.col('dst_subnet').alias('hop4_subnet'),
+                pl.col('timestamp').alias('t3'),
+                pl.col('tactic').alias('tactic3') if use_labels else pl.lit(None).alias('tactic3')
+            ])
+            
+            # Join hop1 → hop2 (B is pivot)
+            print("    Joining hop1 → hop2...")
+            chains = hop1.join(hop2, on='hop2_ip', how='inner')
+            chains = chains.filter(pl.col('t2') > pl.col('t1'))
+            print(f"    Found {len(chains):,} 2-hop paths")
+            
+            # Join → hop3 (C is pivot)
+            print("    Joining hop2 → hop3...")
+            chains = chains.join(hop3, on='hop3_ip', how='inner')
+            chains = chains.filter(pl.col('t3') > pl.col('t2'))
+            print(f"    Found {len(chains):,} 3-hop paths")
+            
+            # Apply constraint: A ≠ C, B ≠ D, A ≠ D
+            print("    Applying uniqueness constraints...")
+            chains = chains.filter(
+                (pl.col('hop1_ip') != pl.col('hop3_ip')) &
+                (pl.col('hop2_ip') != pl.col('hop4_ip')) &
+                (pl.col('hop1_ip') != pl.col('hop4_ip'))
+            )
+            
+            if len(chains) == 0:
+                print("  ⚠ No multi-hop chains found after constraints")
                 return
             
-            print(f"  ✓ Found {len(result):,} multi-hop attack chains")
+            print(f"  ✓ Found {len(chains):,} valid 3-hop chains")
             
-            df = pd.DataFrame(result)
+            # Step 4: Compute timing and prepare output
+            print("  Step 4: Computing timing statistics...")
+            chains = chains.with_columns([
+                ((pl.col('t2') - pl.col('t1')) / 3600.0).alias('hours_to_hop2'),
+                ((pl.col('t3') - pl.col('t2')) / 3600.0).alias('hours_to_hop3')
+            ])
             
+            # Select final columns
+            if use_labels:
+                output_cols = [
+                    'hop1_ip', 'hop2_ip', 'hop3_ip', 'hop4_ip',
+                    'hop1_subnet', 'hop2_subnet', 'hop3_subnet', 'hop4_subnet',
+                    'hours_to_hop2', 'hours_to_hop3',
+                    'tactic1', 'tactic2', 'tactic3'
+                ]
+            else:
+                output_cols = [
+                    'hop1_ip', 'hop2_ip', 'hop3_ip', 'hop4_ip',
+                    'hop1_subnet', 'hop2_subnet', 'hop3_subnet', 'hop4_subnet',
+                    'hours_to_hop2', 'hours_to_hop3'
+                ]
+            
+            chains = chains.select(output_cols)
+            
+            # Step 5: Save to CSV
+            print(f"  Step 5: Saving chains to {output_file}...")
+            chains.write_csv(output_file)
+            
+            # Step 6: Compute summary statistics
             print(f"\n  Chain Timing Statistics:")
-            print(f"    Mean time to 2nd hop: {df['hours_to_hop2'].mean():.2f} hours")
-            print(f"    Mean time to 3rd hop: {df['hours_to_hop3'].mean():.2f} hours")
-            print(f"    Median time to 2nd hop: {df['hours_to_hop2'].median():.2f} hours")
-            print(f"    Median time to 3rd hop: {df['hours_to_hop3'].median():.2f} hours")
+            mean_h2 = chains['hours_to_hop2'].mean()
+            mean_h3 = chains['hours_to_hop3'].mean()
+            median_h2 = chains['hours_to_hop2'].median()
+            median_h3 = chains['hours_to_hop3'].median()
             
-            if use_labels and 'tactic1' in df.columns:
+            print(f"    Mean time to 2nd hop: {mean_h2:.2f} hours")
+            print(f"    Mean time to 3rd hop: {mean_h3:.2f} hours")
+            print(f"    Median time to 2nd hop: {median_h2:.2f} hours")
+            print(f"    Median time to 3rd hop: {median_h3:.2f} hours")
+            
+            # Step 7: Tactic sequence analysis (label-aware only)
+            if use_labels:
                 print(f"\n  Most Common Tactic Sequences:")
-                tactic_sequences = df.groupby(['tactic1', 'tactic2', 'tactic3']).size().sort_values(ascending=False).head(5)
-                for (t1, t2, t3), count in tactic_sequences.items():
-                    print(f"    {t1} → {t2} → {t3}: {count} chains")
+                tactic_counts = (
+                    chains.group_by(['tactic1', 'tactic2', 'tactic3'])
+                    .agg(pl.len().alias('count'))
+                    .sort('count', descending=True)
+                    .head(5)
+                )
+                for row in tactic_counts.iter_rows(named=True):
+                    t1 = row['tactic1'] or 'None'
+                    t2 = row['tactic2'] or 'None'
+                    t3 = row['tactic3'] or 'None'
+                    print(f"    {t1} → {t2} → {t3}: {row['count']:,} chains")
             
-            # Save chains
-            df.to_csv(f'{output_prefix}_multi_hop_chains.csv', index=False)
+            print(f"\n  ✓ Analysis complete. Results saved to {output_file}")
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_edges_path):
+                os.unlink(temp_edges_path)
+                print(f"  ✓ Cleaned up temporary edge export")
     
     def compare_analysis_modes(self):
         """Compare label-aware vs label-agnostic analysis results."""

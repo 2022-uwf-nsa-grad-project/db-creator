@@ -1,0 +1,224 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          THESIS PIPELINE WORKFLOW                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+START HERE: Open thesis_pipeline.ipynb
+│
+├─ Cell 1: Configuration
+│  └─ Set: REBUILD_DATABASE = False
+│  └─ Set: RUN_WINDOW_SWEEP = False  ⚠️ SKIP THIS - Already optimized!
+│  └─ Set: RUN_LABEL_AWARE = True
+│  └─ Set: RUN_LABEL_AGNOSTIC = True
+│
+├─ Cell 2-4: Neo4j Setup
+│  └─ Connect to Neo4j container
+│  └─ Optional: Rebuild database (if REBUILD_DATABASE=True)
+│
+├─ Cell 5-7: Configuration Loading
+│  └─ Skip window sweep (expensive!)
+│  └─ Load existing window optimization results
+│  └─ Use: 48h historical, 24h detection
+│
+├─ Cell 8: Analyzer Setup
+│  └─ Patch reconnaissance sampling
+│  └─ Prepare SubnetPivotAnalyzer
+│
+├─ Cell 9: ★ MAIN ANALYSIS ★ (20-30 minutes)
+│  │
+│  ├─ Label-Aware Mode (10-15 min)
+│  │  ├─ Add subnet labels (deterministic hashing)
+│  │  ├─ Create graph projection
+│  │  ├─ Compute FastRP embeddings (optimized!)
+│  │  ├─ Compute centrality metrics
+│  │  ├─ Identify reconnaissance events
+│  │  ├─ Train/test split (temporal)
+│  │  ├─ Predict pivots
+│  │  ├─ Statistical analysis (with corrections)
+│  │  └─ Generate: *_pivot_predictions.csv
+│  │               *_method_comparison.csv
+│  │
+│  └─ Label-Agnostic Mode (15-20 min)
+│     └─ [Same steps, structural features only]
+│
+├─ Cell 10-11: Artifact Management
+│  └─ Archive results to thesis_results/run_YYYYMMDD_HHMMSS/
+│  └─ Generate summary JSON files
+│
+├─ Cell 12: APOC Export (2-3 min)
+│  └─ Export CONNECTS edges to CSV
+│  └─ Verify permissions
+│
+├─ Cell 13: Multi-Hop Chain Analysis (5 min)
+│  └─ Build 4-hop chains (Polars pipeline)
+│  └─ Label-aware chains
+│  └─ Label-agnostic chains
+│  └─ Visualize chain networks
+│
+├─ Cell 14: Attack Graph Visualization (5 min)
+│  ├─ IP-level graphs (full network)
+│  ├─ Subnet-level graphs (/24 aggregation)
+│  ├─ Role-based coloring (attacker/pivot/victim/neutral)
+│  └─ Generate: *_ip_graph.png
+│               *_subnet_graph.png
+│               *_chain_network.png
+│
+├─ Cell 15: ★ NEW! Auto-Artifact Generation ★ (30 sec)
+│  │
+│  └─ Runs: generate_all_thesis_artifacts.py
+│     │
+│     ├─ Tables
+│     │  ├─ table1_dataset_summary.csv/.tex
+│     │  └─ table2_performance_comparison.csv/.tex
+│     │
+│     ├─ Figures (Publication Quality, 300 DPI)
+│     │  ├─ figure_baseline_comparison.png
+│     │  ├─ figure_similarity_distributions.png
+│     │  ├─ figure_roc_pr_curves.png
+│     │  ├─ figure_subnet_pivot_heatmap.png
+│     │  └─ figure_temporal_analysis.png
+│     │
+│     └─ Summary
+│        └─ statistical_summary.txt
+│
+└─ Cell 16: Cleanup
+   └─ Close connections
+   └─ Optional: Stop Neo4j container
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              OUTPUT STRUCTURE                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+db-creator/
+├── thesis_results/
+│   └── run_20251107_150318_h48_d24/        ← Your analysis run
+│       ├── run_metadata.json                  Configuration
+│       ├── run_summary.json                   Key metrics
+│       ├── label_aware_h48_d24_*.csv          Raw predictions
+│       ├── label_aware_h48_d24_*.png          Visualizations
+│       ├── label_agnostic_h48_d24_*.csv
+│       ├── label_agnostic_h48_d24_*.png
+│       └── mode_comparison.png
+│
+└── thesis_figures/                          ← ★ USE THESE FOR THESIS ★
+    ├── table1_dataset_summary.csv             Chapter 3: Methodology
+    ├── table1_dataset_summary.tex
+    ├── table2_performance_comparison.csv      Chapter 4: Results
+    ├── table2_performance_comparison.tex
+    ├── figure_baseline_comparison.png         Chapter 4: Method comparison
+    ├── figure_similarity_distributions.png    Chapter 4: Discriminative power
+    ├── figure_roc_pr_curves.png               Chapter 4: Performance curves
+    ├── figure_subnet_pivot_heatmap.png        Chapter 4: Subnet analysis
+    ├── figure_temporal_analysis.png           Chapter 4: Timing patterns
+    └── statistical_summary.txt                All chapters: Key numbers
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            WHAT GETS USED WHERE                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+THESIS CHAPTER 3: Methodology
+├─ Table 1: Dataset Summary
+├─ Window configuration (48h/24h)
+└─ Sample counts from run_metadata.json
+
+THESIS CHAPTER 4: Results
+├─ Table 2: Performance Comparison
+├─ Figure: ROC & PR Curves
+├─ Figure: Similarity Distributions
+├─ Figure: Baseline Comparison
+├─ Figure: Subnet Heatmap
+├─ Figure: Temporal Analysis
+├─ Attack graphs from thesis_results/run_*/
+└─ Statistical numbers from statistical_summary.txt
+
+THESIS CHAPTER 5: Discussion
+├─ Mode comparison figure
+├─ Performance trade-offs
+└─ Operational implications
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                       WHAT YOU DON'T NEED TO RUN                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+❌ RUN_WINDOW_SWEEP = False
+   │
+   ├─ Why skip?
+   │  └─ Already optimized (48h/24h is best)
+   │  └─ Very expensive (tests 25 combinations)
+   │  └─ Takes hours instead of minutes
+   │  └─ Won't change your thesis conclusions
+   │
+   └─ When to run?
+      └─ Only if: Exploring new research questions
+      └─ Only if: Dataset has changed significantly
+      └─ Only if: Committee requests window sensitivity analysis
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         TIME & RESOURCE ESTIMATES                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌────────────────────┬──────────────┬─────────────────────────────────────────┐
+│ Step               │ Time         │ Notes                                   │
+├────────────────────┼──────────────┼─────────────────────────────────────────┤
+│ Neo4j startup      │ 30s          │ Instant if already running              │
+│ Database rebuild   │ 5-10min      │ Only if REBUILD_DATABASE=True           │
+│ Label-aware        │ 10-15min     │ Includes FastRP (now 2x faster!)        │
+│ Label-agnostic     │ 15-20min     │ Larger sample size                      │
+│ Visualization      │ 2-3min       │ APOC export + graph rendering           │
+│ Artifact gen       │ 30s          │ Automatic, creates 10+ files            │
+├────────────────────┼──────────────┼─────────────────────────────────────────┤
+│ TOTAL (fresh)      │ 30-50min     │ With database rebuild                   │
+│ TOTAL (existing)   │ 20-30min     │ Without rebuild                         │
+│ Window sweep       │ 10-12 HOURS  │ ⚠️ DON'T RUN UNLESS NECESSARY           │
+└────────────────────┴──────────────┴─────────────────────────────────────────┘
+
+Disk Space Required:
+├─ thesis_results/run_*: ~500MB-1GB per run
+├─ thesis_figures/: ~10-20MB
+└─ Neo4j database: ~2-3GB
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              QUICK REFERENCE                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Configuration Changes:
+├─ Different windows?        → Edit Cell 2: HISTORICAL_WINDOW_HOURS
+├─ Skip label-agnostic?      → Edit Cell 2: RUN_LABEL_AGNOSTIC = False
+├─ Rebuild database?         → Edit Cell 2: REBUILD_DATABASE = True
+└─ Regenerate figures only?  → Run: python generate_all_thesis_artifacts.py
+
+Common Issues:
+├─ "No run directories"      → Run thesis_pipeline.ipynb first
+├─ Missing method CSV        → Check Cell 9 output for errors
+├─ Out of memory            → Reduce CHAIN_SAMPLE_LIMIT in Cell 13
+└─ Figures look wrong       → Set REBUILD_DATABASE=True, rerun
+
+Key Files:
+├─ START_HERE.md                    ← Quick start guide
+├─ THESIS_COMPLETE_GUIDE.md         ← Detailed documentation
+├─ CODE_FIXES_2025-11-07.md         ← Recent optimizations
+├─ thesis_pipeline.ipynb            ← Main analysis script
+└─ generate_all_thesis_artifacts.py ← Figure generator
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                           REPRODUCIBILITY NOTES                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+✓ Random seeds fixed (FastRP, layouts)
+✓ Subnet IDs deterministic (MD5 hash)
+✓ Temporal split documented
+✓ Configuration saved in run_metadata.json
+✓ All parameters logged
+✓ Multiple testing corrections applied
+
+To reproduce exactly:
+1. Use same dataset (UWF-ZeekData24)
+2. Use same window config (48h/24h)
+3. Check random seeds in metadata
+4. Verify FastRP parameters (dim=128, iterations=[0,1,1,1])
+

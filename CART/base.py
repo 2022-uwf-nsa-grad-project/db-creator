@@ -17,6 +17,21 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from tqdm import tqdm
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, will read .env manually
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+
 class Neo4jConnection:
     """
     A base class to handle Neo4j database connections and container management.
@@ -188,7 +203,10 @@ class Neo4jConnection:
             print("Docker requires elevated privileges. Switching to sudo...")
             self._use_sudo = True
             if not self._sudo_password:
-                self._sudo_password = getpass.getpass("Enter sudo password for Docker: ")
+                # Try to load from .env first, otherwise prompt
+                self._sudo_password = os.environ.get('SUDO_PASSWORD')
+                if not self._sudo_password:
+                    self._sudo_password = getpass.getpass("Enter sudo password for Docker: ")
             retry_proc = self._docker_run(["ps"], capture_output=True, check=False)
             if retry_proc.returncode != 0:
                 retry_err = retry_proc.stderr.decode().strip() if retry_proc.stderr else ""
@@ -217,7 +235,10 @@ class Neo4jConnection:
             pass
 
         if not self._sudo_password:
-            self._sudo_password = getpass.getpass("Enter sudo password for host operations: ")
+            # Try to load from .env first, otherwise prompt
+            self._sudo_password = os.environ.get('SUDO_PASSWORD')
+            if not self._sudo_password:
+                self._sudo_password = getpass.getpass("Enter sudo password for host operations: ")
 
         sudo_cmd = ["sudo", "-S"] + cmd
         result = subprocess.run(
