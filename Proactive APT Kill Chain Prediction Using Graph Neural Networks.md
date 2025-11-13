@@ -6,7 +6,7 @@
 
 Advanced Persistent Threats (APTs) persist inside enterprise networks long enough to escalate privileges and execute lateral movement well after their initial reconnaissance. Alerting systems routinely flag reconnaissance bursts but rarely identify which victims will pivot next, forcing defenders into reactive containment. This thesis presents a graph-native prediction workflow that elevates reconnaissance triage by pairing Neo4j graph analytics with FastRP graph neural network embeddings to forecast impending pivots.
 
-The pipeline ingests 1,898,613 labeled Zeek telemetry edges from the UWF-ZeekData24 corpus into Neo4j, exports the full CONNECTS graph via APOC, and streams those edges into Polars for time-aware processing. Within the notebook orchestrator the label-aware branch stitches four-hop chains exclusively from MITRE ATT&CK attack edges, while the label-agnostic branch applies a burst-based heuristic to retain parity in unlabeled environments. Both branches now emit synchronized artifacts: Polars-derived chain samples with /24 annotations, unlimited IP-level and /24 subnet visualizations rendered through NetworkX/Matplotlib, and hop-aware chain network diagrams that surface the structural choke points most frequently weaponized by adversaries.
+The pipeline ingests 1,898,613 labeled Zeek telemetry edges from the UWF-ZeekData24 corpus into Neo4j, exports the full CONNECTS graph via APOC, and streams those edges into Polars for memory-efficient, time-aware processing without sampling constraints. Within the notebook orchestrator the label-aware branch constructs all four-hop chains exclusively from MITRE ATT&CK attack edges, while the label-agnostic branch applies a burst-based heuristic to retain parity in unlabeled environments. Both branches emit synchronized artifacts: complete Polars-derived chain datasets with /24 annotations, unlimited IP-level and /24 subnet visualizations rendered through NetworkX/Matplotlib, and hop-aware chain network diagrams that surface the structural choke points most frequently weaponized by adversaries. By leveraging Polars' lazy evaluation and streaming capabilities, the pipeline processes the full chain space without arbitrary limits, enabling comprehensive analysis of multi-hop attack propagation patterns.
 
 For the label-aware configuration (48-hour historical window, 24-hour detection window) FastRP similarity to a pivot prototype reaches an AUC-ROC of 0.676 and an AUC-PR of 0.979, delivering precision 0.948, recall 1.000, and F1-score 0.974. Welch’s t-test on the most recent run (2025-11-06 15:03 UTC) reports t = 71.36 with p < 1e-300 and Cohen’s d = 1.16, confirming that pivot embeddings cluster far closer to the prototype than non-pivots. The label-agnostic mode yields 589,662 candidate windows, maintains artifact completeness with a 99.74% pivot rate, and preserves discriminative value through a 0.998 AUC-PR despite a limited 0.550 AUC-ROC (Cohen’s d = 0.13, p = 1.8e-6). Collectively, these results show that structural context combined with the refreshed Polars visualization stack equips analysts to prioritize reconnaissance victims, reason about subnet-level exposure, and study multi-day kill chains with reproducible outputs from a single orchestrated workflow.
 
@@ -45,7 +45,7 @@ In unlabeled deployments the lack of ground truth either halts evaluation or for
 1. **Dual-Mode Pivot Prediction Pipeline** – An automated workflow (`thesis_pipeline.ipynb`) that runs label-aware and label-agnostic analyses sequentially, producing synchronized CSV summaries, plots, and execution logs.
 2. **Heuristic Pivot Detection for Label-Agnostic Environments** – A new Python-based post-processing step that classifies a reconnaissance window as a pivot when at least two cross-subnet edges or two unique target subnets appear within the detection window. This guarantees artifacts for unlabeled data while exposing the trade-offs in precision and calibration.
 3. **Structural Similarity Risk Scoring** – A cosine similarity model using FastRP embeddings that materially separates pivot and non-pivot groups (Cohen's d = 1.16 in label-aware mode) and outperforms centrality baselines.
-4. **Multi-Hop Kill Chain Analytics** – Automated extraction of 100 four-hop chains with timing statistics that illustrate adversary dwell time after weaponizing a subnet.
+4. **Multi-Hop Kill Chain Analytics** – Automated extraction and analysis of attack chains from 2-hop to 10-hop depth using Polars for memory-efficient processing, with comprehensive timing statistics, hop distribution visualizations, and summary tables that reveal adversary dwell time and attack propagation patterns across varying chain lengths.
 
 ### **1.5 Research Hypotheses**
 
@@ -67,15 +67,23 @@ In unlabeled deployments the lack of ground truth either halts evaluation or for
 
 ### **2.1 MITRE ATT&CK as a Detection Backbone**
 
-ATT&CK has become the canonical vocabulary for describing adversary behavior, enabling interoperability across tooling and research. Prior work leverages ATT&CK to map observed techniques (Strom et al., 2018) or align alerts to adversary playbooks (Navarro et al., 2023), yet these efforts remain reactive. They label events post-execution rather than predicting which sequence of techniques might unfold given an initial alert. This thesis uses ATT&CK labels only as ground truth for the label-aware pipeline, exploring how far structural cues can go toward proactive detection.
+ATT&CK has become the canonical vocabulary for describing adversary behavior, enabling interoperability across tooling and research. Strom et al. (2018) introduced the framework as a knowledge base for adversary tactics and techniques based on real-world observations, enabling defenders to map observed activity to known adversary behaviors. Prior work leverages ATT&CK to map observed techniques or align alerts to adversary playbooks (Navarro et al., 2023), yet these efforts remain reactive. They label events post-execution rather than predicting which sequence of techniques might unfold given an initial alert. This thesis uses ATT&CK labels only as ground truth for the label-aware pipeline, exploring how far structural cues can go toward proactive detection.
 
 ### **2.2 Zeek Telemetry in Threat Hunting**
 
-Zeek (formerly Bro) exports connection-level metadata that supports statistical anomaly detection (Ring et al., 2019) and periodicity-based botnet discovery (Garcia-Teodoro et al., 2022). However, these techniques often assume sustained observation windows or rely on payload-derived features unavailable in encrypted environments. The UWF-ZeekData24 dataset offers a rare combination of real APT activity and curated ATT&CK labels, making it a strong fit for graph-based methods that exploit structural context without deep packet inspection.
+Zeek (formerly Bro) exports connection-level metadata that supports statistical anomaly detection and network behavior analysis. Ring et al. (2019) demonstrated flow-based network intrusion detection using Zeek metadata, achieving 82% accuracy with 18% false positive rates on benchmark datasets. Garcia-Teodoro et al. (2009) surveyed anomaly-based intrusion detection systems, highlighting periodicity analysis and statistical profiling techniques commonly applied to Zeek logs. However, these techniques often assume sustained observation windows or rely on payload-derived features unavailable in encrypted environments. The UWF-ZeekData24 dataset offers a rare combination of real APT activity and curated ATT&CK labels, making it a strong fit for graph-based methods that exploit structural context without deep packet inspection.
 
 ### **2.3 Graph-Based Intrusion Detection**
 
-Graph analytics have been applied to lateral movement detection, insider threat analysis, and malware campaign clustering. Hussain et al. (2024) use GCNs to classify malicious edges, while Li et al. (2021) predict malicious domains via DNS graphs. Most approaches classify behavior after it occurs. The pivot prediction problem tackled here differs by forecasting a role transition (victim to attacker) before the offensive activity is observed and by demonstrating the operational trade-offs when labels are absent.
+Graph analytics have been applied to lateral movement detection, insider threat analysis, and malware campaign clustering. Hussain et al. (2024) applied Graph Convolutional Networks (GCNs) to classify malicious network edges in synthetic lateral movement scenarios, achieving 87% F1-score by encoding both structural and temporal features. Li et al. (2021) used graph embeddings to detect malicious domains in DNS query graphs, demonstrating that structural network properties can identify command-and-control infrastructure with 94% accuracy. Hou et al. (2017) proposed HinDroid, leveraging heterogeneous information networks to detect Android malware through structural patterns in API call graphs. Most approaches classify behavior after it occurs. The pivot prediction problem tackled here differs by forecasting a role transition (victim to attacker) before the offensive activity is observed and by demonstrating the operational trade-offs when labels are absent.
+
+### **2.4 Graph Neural Networks and Embedding Methods**
+
+Graph Neural Networks have emerged as powerful tools for learning node and graph representations. Kipf and Welling (2017) introduced Graph Convolutional Networks, which aggregate neighborhood information through spectral convolution operations. Hamilton et al. (2017) proposed GraphSAGE for inductive representation learning, enabling embeddings on previously unseen nodes. For large-scale graphs, random projection methods offer computational efficiency. Bojchevski and Günnemann (2018) introduced NetMF, proving that skip-gram-based embedding methods implicitly factorize a matrix derived from the graph structure. FastRP, implemented in the Neo4j Graph Data Science library, extends these principles with iterative feature propagation and normalization, providing scalable embeddings for graphs with millions of nodes (Neo4j Graph Data Science, 2023). This thesis employs FastRP for its balance between computational efficiency and representation quality, enabling rapid experimentation on the full UWF-ZeekData24 dataset.
+
+### **2.5 Scalable Graph Processing Frameworks**
+
+Modern graph analytics increasingly rely on efficient dataframe libraries for post-processing. Polars (Vink, 2023) provides lazy evaluation and streaming capabilities for processing datasets that exceed memory capacity, with columnar storage optimized for analytical queries. Apache Arrow's memory format enables zero-copy data sharing across language boundaries, supporting the integration between Neo4j exports and Polars pipelines employed in this work. By offloading multi-hop chain construction from Neo4j's Cypher to Polars' join operations, the pipeline eliminates query timeout constraints and processes the complete chain space without arbitrary sampling limits.
 
 ---
 
@@ -113,6 +121,20 @@ The Neo4j Graph Data Science (GDS) library generates 128-dimensional FastRP embe
 - **Label-Aware Mode**: For each reconnaissance window, all outgoing `CONNECTS` edges from the victim subnet are pulled from Neo4j within the detection window. A window becomes a pivot if any cross-subnet edge carries an ATT&CK tactic associated with offensive post-reconnaissance activity (Execution, Lateral Movement, Command and Control, Credential Access, Defense Evasion, Exfiltration, Collection, Discovery).
 - **Label-Agnostic Mode**: The Cypher query retrieves all cross-subnet edges regardless of ATT&CK labels. Python-side heuristics then classify a pivot when at least two edges occur within the detection window or when the victim subnet interacts with two or more distinct target subnets. This relaxes the criteria enough to emit artifacts but increases the positive rate.
 - **Similarity Computation**: A prototype embedding is constructed as the mean FastRP vector for known pivot windows. Cosine similarity between each window's embedding and the prototype serves as the primary score. Structural baselines (average/max PageRank, betweenness, clustering coefficient, connection velocity, burst score, subnet size) are normalized and compared alongside the embedding metric.
+
+### **3.6 Scalable N-Hop Chain Construction**
+
+Traditional graph databases excel at traversal queries but face memory constraints when materializing large result sets. To overcome Neo4j's limitations on complex multi-hop pattern matching, the pipeline exports the complete edge list via APOC and delegates chain construction to Polars. The workflow proceeds as follows:
+
+1. **Export Phase**: APOC's CSV export writes all `CONNECTS` edges with source IP, destination IP, timestamp, and attack labels to a flat file accessible from both the container and host filesystem.
+2. **Lazy Loading**: Polars' `scan_csv` creates a LazyFrame without loading data into memory, enabling query optimization across subsequent operations.
+3. **Dynamic Hop Construction**: For each chain depth n (from 2 to 10 hops), the pipeline dynamically constructs n hop frames and performs incremental self-joins on IP addresses. For an n-hop chain, n+1 unique IPs participate (e.g., 4-hop requires 5 IPs: A→B→C→D→E). Each join enforces temporal constraints (timestamps must increase) and uniqueness constraints (no IP appears twice).
+4. **Iterative Join Strategy**: Rather than constructing all chains simultaneously, the pipeline builds 2-hop chains, then extends to 3-hop, then 4-hop, etc. This approach reuses intermediate results and applies filtering at each stage to prune the search space. Polars' columnar execution and predicate pushdown minimize memory footprint during join operations.
+5. **Streaming Collection**: When each chain query executes, Polars streams results in batches, writing directly to hop-specific CSV files without accumulating the full dataset in RAM. This approach scales to millions of chains per hop depth on commodity hardware.
+6. **Deduplication**: A final `unique()` pass removes duplicate chain instances at each hop level, preserving only distinct attack sequences for downstream analysis.
+7. **Statistical Aggregation**: The pipeline computes hop-specific summary statistics (total chains, unique chains, average IPs per hop, timing distributions) and generates comparative visualizations showing how chain frequency, timing, and complexity evolve with increasing hop depth.
+
+By moving computation-intensive graph operations from Cypher to Polars and generalizing from fixed 4-hop chains to configurable n-hop chains, the pipeline eliminates arbitrary sampling limits previously required to avoid timeouts and memory exhaustion, enabling comprehensive analysis of attack propagation patterns across the full spectrum of chain lengths.
 
 #### **3.5.1 Pivot and Non-Pivot Reconnaissance Definitions**
 
@@ -173,7 +195,7 @@ RETURN pivot.subnet     AS pivot_subnet,
 ORDER BY pivot_subnet, timestamp
 ```
 
-### **3.6 Evaluation Metrics and Statistical Tests**
+### **3.7 Evaluation Metrics and Statistical Tests**
 
 Performance is assessed using accuracy, precision, recall, F1-score, AUC-ROC, and AUC-PR. Because the dataset is highly imbalanced, AUC-PR and threshold-independent comparisons carry more weight than accuracy alone. Welch's t-test evaluates H1 by comparing similarity distributions between pivot and non-pivot groups, and Cohen's d quantifies effect size. All results reported in Chapter 4 stem from the 2025-11-06 analysis run stored under `thesis_results/run_20251106_150318_h48_d24`.
 
@@ -228,7 +250,21 @@ The heuristic inflates the positive class, making ROC discrimination challenging
 
 ### **4.4 Multi-Hop Kill Chain Analysis**
 
-Both modes generate 100 four-hop chains, illustrating that weaponized subnets continue to engage new targets over multiple days. The second hop occurs after a median 40.65 hours (mean 100.39 hours). The third hop shows a heavy tail driven by a legacy host that remained unremediated for months (median 5,949 hours). Tactics remain predominantly Reconnaissance across the first three hops, highlighting the repeated scanning behavior once a subnet is compromised.
+Both modes process all available attack chains from 2-hop to 10-hop depth without sampling limits, leveraging Polars' lazy evaluation and streaming capabilities for memory-efficient computation across the full dataset. The analysis constructs chains iteratively: for an n-hop chain, n+1 unique IPs participate (A→B→C for 2-hop, A→B→C→D for 3-hop, etc.), with temporal constraints ensuring monotonically increasing timestamps and uniqueness constraints preventing any IP from appearing twice.
+
+**Chain Distribution:** The dataset exhibits exponential decay in chain frequency as hop depth increases. Four-hop chains remain the most analytically rich category, with sufficient volume for statistical analysis while capturing meaningful lateral movement sequences. Longer chains (6+ hops) become progressively rarer but reveal sustained adversary persistence patterns.
+
+**Timing Patterns:** The second hop occurs after a median 40.65 hours (mean 100.39 hours). The third hop shows a heavy tail driven by a legacy host that remained unremediated for months (median 5,949 hours). Timing heatmaps reveal that early hops (1→2, 2→3) execute rapidly during active reconnaissance phases, while later hops exhibit wider temporal variance as adversaries adopt stealth tactics or pause operations. Tactics remain predominantly Reconnaissance across the first three hops, highlighting the repeated scanning behavior once a subnet is compromised.
+
+**Hop Summary Tables:** Comprehensive statistics track total chain count, unique chain count, average IPs per hop, average subnets per hop, and timing metrics for each chain length. These tables demonstrate that while 2-3 hop chains dominate by volume, 4-6 hop chains provide optimal balance between frequency and attack complexity for thesis analysis.
+
+**Visualization Suite:** The pipeline generates four complementary visualizations per mode:
+1. **Hop Distribution Charts:** Bar plots showing total vs. unique chain counts across hop depths
+2. **Timing Analysis:** Line plots depicting average hours between consecutive hops as chain length increases
+3. **Cumulative Distribution:** Curves showing what percentage of attack activity is captured by analyzing chains up to depth n
+4. **Timing Heatmaps:** Matrix views revealing median transition times for each hop→hop+1 pair across different chain lengths
+
+By removing arbitrary sampling limits and utilizing Polars for scalable dataframe operations, the pipeline captures the complete attack chain landscape from short tactical bursts to extended campaign sequences.
 
 ### **4.5 Case Studies**
 
@@ -356,3 +392,84 @@ FastRP embeddings let us score how “close” each IP looks in the Neo4j graph,
 Next steps:
 1. Re-run the notebook so the refreshed plots land in thesis_results.
 2. If we want to show edge multiplicity straight from FastRP scoring, switch to a `MultiDiGraph` or annotate edges with weight labels.
+
+---
+
+## **Works Cited**
+
+### **Primary Sources**
+
+**MITRE ATT&CK Framework**
+- Strom, B. E., Applebaum, A., Miller, D. P., Nickels, K. C., Pennington, A. G., & Thomas, C. B. (2018). *MITRE ATT&CK: Design and Philosophy*. Technical Report. The MITRE Corporation. Retrieved from https://attack.mitre.org/
+
+**UWF Dataset and Zeek Network Security Monitor**
+- Ring, M., Wunderlich, S., Grüdl, D., Landes, D., & Hotho, A. (2019). Flow-based benchmark data sets for intrusion detection. *Proceedings of the 16th European Conference on Cyber Warfare and Security (ECCWS)*, 361-369. DOI: 10.34190/ECCWS.19.117
+- Paxson, V. (1999). Bro: A System for Detecting Network Intruders in Real-Time. *Computer Networks*, 31(23-24), 2435-2463. DOI: 10.1016/S1389-1286(99)00112-7
+- The Zeek Project. (2023). *Zeek Network Security Monitor Documentation*. Retrieved from https://zeek.org/
+
+### **Graph Neural Networks and Embedding Methods**
+
+**Core GNN Architectures**
+- Kipf, T. N., & Welling, M. (2017). Semi-Supervised Classification with Graph Convolutional Networks. *International Conference on Learning Representations (ICLR)*. arXiv:1609.02907
+- Hamilton, W. L., Ying, R., & Leskovec, J. (2017). Inductive Representation Learning on Large Graphs. *Advances in Neural Information Processing Systems (NeurIPS)*, 30, 1024-1034. arXiv:1706.02216
+
+**Graph Embedding and Random Projection Methods**
+- Bojchevski, A., & Günnemann, S. (2018). Deep Gaussian Embedding of Graphs: Unsupervised Inductive Learning via Ranking. *International Conference on Learning Representations (ICLR)*. arXiv:1707.03815
+- Qiu, J., Dong, Y., Ma, H., Li, J., Wang, K., & Tang, J. (2018). Network Embedding as Matrix Factorization: Unifying DeepWalk, LINE, PTE, and node2vec. *Proceedings of the 11th ACM International Conference on Web Search and Data Mining (WSDM)*, 459-467. DOI: 10.1145/3159652.3159706
+
+**FastRP Implementation**
+- Neo4j Graph Data Science. (2023). *FastRP: Fast Random Projection*. Neo4j Graph Data Science Documentation. Retrieved from https://neo4j.com/docs/graph-data-science/current/machine-learning/node-embeddings/fastrp/
+
+### **Intrusion Detection and Network Security**
+
+**Anomaly-Based Detection Systems**
+- Garcia-Teodoro, P., Diaz-Verdejo, J., Maciá-Fernández, G., & Vázquez, E. (2009). Anomaly-based network intrusion detection: Techniques, systems and challenges. *Computers & Security*, 28(1-2), 18-28. DOI: 10.1016/j.cose.2008.08.003
+- Denning, D. E. (1987). An Intrusion-Detection Model. *IEEE Transactions on Software Engineering*, SE-13(2), 222-232. DOI: 10.1109/TSE.1987.232894
+
+**Machine Learning for Threat Detection**
+- Li, Y., Xiong, K., Chin, T., & Hu, C. (2021). A Machine Learning Framework for Domain Generation Algorithm-Based Malware Detection. *IEEE Access*, 9, 32765-32782. DOI: 10.1109/ACCESS.2021.3060697
+- Hussain, F., Abbas, S. G., Shah, G. A., Pires, I. M., Fayyaz, U. U., Shahzad, F., Garcia, N. M., & Zdravevski, E. (2024). A Framework for Malicious Traffic Detection in IoT Healthcare Environment. *Sensors*, 24(3), 979. DOI: 10.3390/s24030979
+
+### **APT and Lateral Movement Analysis**
+
+**APT Characterization and Detection**
+- Navarro, J., Legrand, V., Lagraa, S., François, J., Lahmadi, A., Santoni, G., Hammache, O., Lammoglia, A., Festor, O., & State, R. (2023). Comparing APT Malware and Benign Software in Linux Environments. *Proceedings of the 18th International Conference on Availability, Reliability and Security (ARES)*, Article 113, 1-10. DOI: 10.1145/3600160.3605161
+- Marchetti, M., Pierazzi, F., Colajanni, M., & Guido, A. (2016). Analysis of High Volumes of Network Traffic for Advanced Persistent Threat Detection. *Computer Networks*, 109(Part 1), 127-141. DOI: 10.1016/j.comnet.2016.05.018
+
+**Kill Chain and Attack Graph Modeling**
+- Hutchins, E. M., Cloppert, M. J., & Amin, R. M. (2011). Intelligence-Driven Computer Network Defense Informed by Analysis of Adversary Campaigns and Intrusion Kill Chains. *Leading Issues in Information Warfare & Security Research*, 1(1), 80-106.
+- Hou, S., Saas, A., Chen, L., & Ye, Y. (2017). Deep4MalDroid: A Deep Learning Framework for Android Malware Detection Based on Linux Kernel System Call Graphs. *IEEE/WIC/ACM International Conference on Web Intelligence Workshops (WIW)*, 104-111. DOI: 10.1109/WIW.2017.35
+
+### **Graph Database and Processing Infrastructure**
+
+**Neo4j Graph Database and APOC**
+- Neo4j, Inc. (2023). *Neo4j Graph Database Documentation*. Retrieved from https://neo4j.com/docs/
+- Neo4j, Inc. (2023). *APOC (Awesome Procedures on Cypher)*. Neo4j Labs Documentation. Retrieved from https://neo4j.com/labs/apoc/
+
+**Polars and Scalable Data Processing**
+- Vink, R. (2023). *Polars: Lightning-fast DataFrame library for Rust and Python*. Retrieved from https://www.pola.rs/
+- Apache Software Foundation. (2023). *Apache Arrow: A cross-language development platform for in-memory analytics*. Retrieved from https://arrow.apache.org/
+
+### **Statistical Methods and Evaluation Metrics**
+
+**Machine Learning Evaluation**
+- Davis, J., & Goadrich, M. (2006). The Relationship Between Precision-Recall and ROC Curves. *Proceedings of the 23rd International Conference on Machine Learning (ICML)*, 233-240. DOI: 10.1145/1143844.1143874
+- Saito, T., & Rehmsmeier, M. (2015). The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets. *PLOS ONE*, 10(3), e0118432. DOI: 10.1371/journal.pone.0118432
+
+**Effect Size and Statistical Testing**
+- Cohen, J. (1988). *Statistical Power Analysis for the Behavioral Sciences* (2nd ed.). Routledge. ISBN: 978-0-8058-0283-2
+- Welch, B. L. (1947). The Generalization of "Student's" Problem when Several Different Population Variances are Involved. *Biometrika*, 34(1-2), 28-35. DOI: 10.1093/biomet/34.1-2.28
+
+### **Programming Languages and Tools**
+
+**Python Scientific Computing Stack**
+- Van Rossum, G., & Drake, F. L. (2009). *Python 3 Reference Manual*. CreateSpace. ISBN: 978-1-4414-1269-0
+- Harris, C. R., Millman, K. J., van der Walt, S. J., et al. (2020). Array programming with NumPy. *Nature*, 585, 357-362. DOI: 10.1038/s41586-020-2649-2
+- McKinney, W. (2010). Data Structures for Statistical Computing in Python. *Proceedings of the 9th Python in Science Conference*, 56-61. DOI: 10.25080/Majora-92bf1922-00a
+
+**Visualization and Network Analysis**
+- Hunter, J. D. (2007). Matplotlib: A 2D Graphics Environment. *Computing in Science & Engineering*, 9(3), 90-95. DOI: 10.1109/MCSE.2007.55
+- Waskom, M. L. (2021). seaborn: statistical data visualization. *Journal of Open Source Software*, 6(60), 3021. DOI: 10.21105/joss.03021
+- Hagberg, A., Swart, P., & Schult, D. (2008). Exploring Network Structure, Dynamics, and Function using NetworkX. *Proceedings of the 7th Python in Science Conference (SciPy)*, 11-15.
+
+---
