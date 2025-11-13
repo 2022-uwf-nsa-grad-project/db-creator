@@ -1,7 +1,0 @@
-*.csv
-*.parquet
-data/
-*.db
-*.db.id
-*.json
-.env
