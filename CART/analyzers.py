@@ -1887,8 +1887,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     
                     print(f"  ✓ Exported {count:,} edges to temporary file")
                 
-                # Step 2: Load edges with Pandas and filter
-                print("  Step 2: Loading edges into Pandas...")
+                # Step 2: Load edges and build adjacency structure
+                print("  Step 2: Loading edges and building adjacency structure...")
                 edges_df = pd.read_csv(temp_edges_path)
                 os.unlink(temp_edges_path)  # Clean up immediately
                 
@@ -1898,135 +1898,158 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 else:
                     print(f"  ✓ Loaded {len(edges_df):,} edges (all traffic)")
                 
-                # Build edge index
-                print("    Building edge index...")
-                edge_index = defaultdict(list)
-                for _, row in tqdm(edges_df.iterrows(), total=len(edges_df), desc="    Indexing edges", unit=" edges"):
-                    edge_info = {
+                # Build adjacency list: src_ip -> list of (dst_ip, timestamp, dst_subnet, tactic)
+                print("    Building adjacency list...")
+                adj_list = defaultdict(list)
+                for _, row in edges_df.iterrows():
+                    adj_list[row['src_ip']].append({
                         'dst_ip': row['dst_ip'],
                         'timestamp': row['timestamp'],
                         'src_subnet': row['src_subnet'],
                         'dst_subnet': row['dst_subnet'],
                         'tactic': row.get('tactic') if use_labels else None
-                    }
-                    edge_index[row['src_ip']].append(edge_info)
+                    })
                 
-                print(f"    ✓ Indexed {len(edge_index):,} source nodes")
+                # Sort each adjacency list by timestamp for faster temporal filtering
+                for src_ip in adj_list:
+                    adj_list[src_ip].sort(key=lambda x: x['timestamp'])
                 
-                # Cache the edge index
+                print(f"    ✓ Built adjacency list with {len(adj_list):,} nodes")
+                
+                # Cache the adjacency structure
                 if use_cache:
-                    print(f"    Caching edge index to {edge_cache_file}...")
+                    print(f"    Caching adjacency list to {edge_cache_file}...")
                     with open(edge_cache_file, 'wb') as f:
-                        pickle.dump(dict(edge_index), f)
-                    print("    ✓ Edge index cached")
+                        pickle.dump(dict(adj_list), f)
+                    print("    ✓ Adjacency list cached")
             
-            # Step 3: Build chains using incremental node-by-node traversal
-            print(f"  Step 3: Building {n_hops}-hop chains using incremental traversal...")
+            # Step 3: Build chains incrementally using batch expansion
+            print(f"  Step 3: Building {n_hops}-hop chains using batch expansion...")
+            print(f"    Using adjacency lookups to avoid expensive joins")
             
-            # Recursive exploration function
-            def explore_recursive(current_ip, current_subnet, current_time, path, subnets, timestamps, tactics, depth, max_depth):
-                """
-                Recursively explore chains from current node using pure recursion.
-                Matches the thesis pipeline's incremental traversal methodology.
-                """
-                # Base case: reached desired depth
-                if depth == max_depth:
-                    return [(path, subnets, timestamps, tactics)]
-                
-                # Dead end: no outgoing edges
-                if current_ip not in edge_index:
-                    return []
-                
-                all_chains = []
-                
-                # Explore all valid next hops
-                for edge in edge_index[current_ip]:
-                    next_ip = edge['dst_ip']
-                    next_time = edge['timestamp']
-                    next_subnet = edge['dst_subnet']
-                    next_tactic = edge['tactic']
-                    
-                    # Temporal constraint: must move forward in time
-                    if next_time <= current_time:
-                        continue
-                    
-                    # No cycles: node cannot appear twice
-                    if next_ip in path:
-                        continue
-                    
-                    # RECURSE: explore from next node
-                    sub_chains = explore_recursive(
-                        next_ip, next_subnet, next_time,
-                        path + [next_ip],
-                        subnets + [next_subnet],
-                        timestamps + [next_time],
-                        tactics + [next_tactic],
-                        depth + 1,
-                        max_depth
-                    )
-                    
-                    all_chains.extend(sub_chains)
-                
-                return all_chains
+            BATCH_SIZE = 10000  # Process chains in batches to manage memory
             
-            # Get unique source nodes
-            unique_sources = list(edge_index.keys())
-            print(f"    Exploring from {len(unique_sources):,} starting nodes...")
+            # Initialize with 1-hop "chains" (single edges)
+            # Format: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
+            current_chains = []
+            for src_ip, edges in adj_list.items():
+                src_subnet = edges[0]['src_subnet'] if edges else None
+                for edge in edges:
+                    current_chains.append([
+                        src_ip, src_subnet,
+                        edge['dst_ip'], edge['dst_subnet'], edge['timestamp'],
+                        edge['tactic']
+                    ])
             
-            # Process nodes with progress bar
-            all_chains = []
-            for start_ip in tqdm(unique_sources, desc=f"    Building {n_hops}-hop chains", unit=" nodes"):
-                # Get subnet for starting IP (from first outgoing edge)
-                start_subnet = edge_index[start_ip][0]['src_subnet'] if edge_index[start_ip] else None
+            print(f"    Starting with {len(current_chains):,} 1-hop chains (base edges)")
+            
+            # Extend chains hop by hop
+            for hop_num in range(2, n_hops + 1):
+                print(f"    Extending to {hop_num}-hop chains...")
+                next_chains = []
                 
-                # Recursively explore all n-hop chains
-                recursive_chains = explore_recursive(
-                    start_ip, start_subnet, 0,  # Start with time=0
-                    [start_ip], [start_subnet], [0], [],  # Initial path
-                    depth=0, max_depth=n_hops
-                )
+                # Process in batches to show progress
+                num_batches = (len(current_chains) + BATCH_SIZE - 1) // BATCH_SIZE
                 
-                # Collect chains (will convert format later)
-                all_chains.extend(recursive_chains)
+                with tqdm(total=len(current_chains), desc=f"      Processing chains", unit=" chains") as pbar:
+                    for batch_idx in range(num_batches):
+                        start_idx = batch_idx * BATCH_SIZE
+                        end_idx = min(start_idx + BATCH_SIZE, len(current_chains))
+                        batch = current_chains[start_idx:end_idx]
+                        
+                        for chain in batch:
+                            # Get the last node in the chain
+                            # Chain structure: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
+                            last_hop_idx = 2 + (hop_num - 1) * 3  # Position of last hop's IP
+                            last_ip = chain[last_hop_idx]
+                            last_time = chain[last_hop_idx + 2]
+                            
+                            # Find all valid next edges
+                            if last_ip in adj_list:
+                                for edge in adj_list[last_ip]:
+                                    # Temporal constraint
+                                    if edge['timestamp'] <= last_time:
+                                        continue
+                                    
+                                    # Cycle prevention: check if dst_ip already in chain
+                                    # IPs are at positions: 0, 2, 5, 8, ... = 0, then 2+3*k
+                                    dst_ip = edge['dst_ip']
+                                    is_cycle = False
+                                    for k in range(hop_num):
+                                        ip_pos = 0 if k == 0 else 2 + k * 3
+                                        if chain[ip_pos] == dst_ip:
+                                            is_cycle = True
+                                            break
+                                    
+                                    if not is_cycle:
+                                        # Extend chain
+                                        new_chain = chain + [
+                                            dst_ip,
+                                            edge['dst_subnet'],
+                                            edge['timestamp'],
+                                            edge['tactic']
+                                        ]
+                                        next_chains.append(new_chain)
+                        
+                        pbar.update(len(batch))
+                
+                current_chains = next_chains
+                print(f"      ✓ Found {len(current_chains):,} valid {hop_num}-hop chains")
+                
+                # Early stopping if no chains remain
+                if len(current_chains) == 0:
+                    print(f"      ⚠ No chains found at depth {hop_num}, stopping")
+                    return
+                
+                # Safety check: if chains are exploding, warn user
+                if len(current_chains) > 10_000_000:
+                    print(f"      ⚠ WARNING: {len(current_chains):,} chains detected!")
+                    print(f"      This may consume significant memory. Consider filtering more aggressively.")
             
-            if len(all_chains) == 0:
-                print("  ⚠ No multi-hop chains found")
-                return
+            print(f"  ✓ Built {len(current_chains):,} valid {n_hops}-hop chains")
             
-            print(f"  ✓ Found {len(all_chains):,} valid {n_hops}-hop chains")
+            # Convert flat list format to structured data
+            print("    Converting chains to structured format...")
+            chains_data = []
+            for chain in tqdm(current_chains, desc="      Structuring", unit=" chains"):
+                # Parse chain: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
+                record = {}
+                for hop_idx in range(n_hops + 1):
+                    if hop_idx == 0:
+                        record['hop1_ip'] = chain[0]
+                        record['hop1_subnet'] = chain[1]
+                    else:
+                        pos = 2 + (hop_idx - 1) * 3
+                        record[f'hop{hop_idx + 1}_ip'] = chain[pos]
+                        record[f'hop{hop_idx + 1}_subnet'] = chain[pos + 1]
+                        record[f'hop{hop_idx + 1}_time'] = chain[pos + 2]
+                        if use_labels:
+                            record[f'tactic{hop_idx}'] = chain[pos + 3] if len(chain) > pos + 3 else None
+                chains_data.append(record)
+            
+            # Convert to Polars DataFrame
+            chains = pl.DataFrame(chains_data)
             
             # Cache the results
             if use_cache:
                 print(f"    Caching chains to {cache_file}...")
                 with open(cache_file, 'wb') as f:
-                    pickle.dump(all_chains, f)
+                    pickle.dump(chains, f)
                 print("    ✓ Chains cached for future use")
         
-        # Step 4: Convert chains to dictionary format
-        print("  Step 4: Converting chains to DataFrame format...")
+        # Step 4: Compute timing columns (hours between hops)
+        print("  Step 4: Computing timing statistics...")
         
-        def chain_to_dict(path, subnets, timestamps, tactics, max_hops):
-            """Convert recursive chain representation to dictionary with dynamic hop count."""
-            chain = {}
-            for i, (ip, subnet, ts) in enumerate(zip(path, subnets, timestamps), start=1):
-                chain[f'hop{i}_ip'] = ip
-                chain[f'hop{i}_subnet'] = subnet
-                if i == 1:
-                    continue  # No timing for first hop
-                chain[f'hours_to_hop{i}'] = (ts - timestamps[i-2]) / 3600.0
-                if use_labels and i <= len(tactics):
-                    chain[f'tactic{i-1}'] = tactics[i-2]
-            return chain
+        for hop_num in range(2, n_hops + 2):
+            if f'hop{hop_num}_time' in chains.columns:
+                prev_time_col = f'hop{hop_num - 1}_time' if hop_num > 2 else 'hop2_time'
+                if prev_time_col in chains.columns:
+                    chains = chains.with_columns([
+                        ((pl.col(f'hop{hop_num}_time') - pl.col(prev_time_col)) / 3600.0)
+                        .alias(f'hours_to_hop{hop_num}')
+                    ])
         
-        all_chains_dicts = []
-        for path, subnets, timestamps, tactics in tqdm(all_chains, desc="    Converting to DataFrame", unit=" chains"):
-            chain_dict = chain_to_dict(path, subnets, timestamps, tactics, n_hops)
-            all_chains_dicts.append(chain_dict)
-        
-        chains_df = pd.DataFrame(all_chains_dicts)
-        
-        # Convert to Polars for final processing
-        chains = pl.from_pandas(chains_df)
+        print(f"    ✓ Added timing columns")
         
         # Step 5: Save to CSV
         print(f"  Step 5: Saving chains to {output_file}...")
