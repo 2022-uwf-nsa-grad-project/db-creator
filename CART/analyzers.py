@@ -20,6 +20,11 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 
+try:
+    import polars as pl
+except ImportError:
+    pl = None
+
 warnings.filterwarnings('ignore')
 
 
@@ -1812,16 +1817,11 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         """
         print(f"\n--- Multi-Hop Attack Chain Analysis ({n_hops}-hop chains, Incremental Traversal) ---")
         
-        try:
-            import polars as pl
-            import pandas as pd
-        except ImportError:
-            print("  ⚠ Polars/Pandas not installed. Run: pip install polars pandas")
+        if pl is None:
+            print("  ⚠ Polars not installed. Run: pip install polars")
             return
         
-        from collections import defaultdict
         import tempfile
-        import os
         
         output_file = f'{output_prefix}_{n_hops}hop_chains.csv'
         
