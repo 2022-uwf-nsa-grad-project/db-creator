@@ -14,6 +14,11 @@ from tqdm import tqdm
 from scipy import stats
 from collections import defaultdict
 import ipaddress
+import hashlib
+import pickle
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 
 warnings.filterwarnings('ignore')
 
@@ -732,7 +737,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             print("  ✓ Subnet indices created")
     
     def run_full_analysis(self, mode='both', historical_window_hours=24, 
-                         detection_window_hours=24, embedding_dim=128):
+                         detection_window_hours=24, embedding_dim=128, n_hops=3):
         """
         Run complete subnet-aware pivot prediction analysis.
         
@@ -741,6 +746,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             historical_window_hours: Hours of history to consider before reconnaissance
             detection_window_hours: Hours after reconnaissance to check for pivot behavior
             embedding_dim: Dimension of FastRP embeddings
+            n_hops: Number of hops for multi-hop chain analysis (default: 3)
         """
         try:
             if not self.connect():
@@ -754,6 +760,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             print(f"  Historical window: {historical_window_hours} hours")
             print(f"  Detection window: {detection_window_hours} hours")
             print(f"  Embedding dimension: {embedding_dim}")
+            print(f"  Multi-hop chain depth: {n_hops} hops")
             
             # Add subnet labels if not already present
             self.add_subnet_labels()
@@ -768,7 +775,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     historical_window_hours=historical_window_hours,
                     detection_window_hours=detection_window_hours,
                     embedding_dim=embedding_dim,
-                    output_prefix='label_aware'
+                    output_prefix='label_aware',
+                    n_hops=n_hops
                 )
             
             if mode in ['label_agnostic', 'both']:
@@ -780,7 +788,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     historical_window_hours=historical_window_hours,
                     detection_window_hours=detection_window_hours,
                     embedding_dim=embedding_dim,
-                    output_prefix='label_agnostic'
+                    output_prefix='label_agnostic',
+                    n_hops=n_hops
                 )
             
             # Compare results if both modes were run
@@ -1239,7 +1248,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
     
     def run_pivot_prediction(self, use_labels: bool, historical_window_hours: int,
                             detection_window_hours: int, embedding_dim: int,
-                            output_prefix: str):
+                            output_prefix: str, n_hops: int = 3):
         """Run the complete pivot prediction pipeline."""
         
         # Step 1: Create graph projection
@@ -1358,7 +1367,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         self.compare_with_baselines(test_df, output_prefix)
         
         # Step 12: Multi-hop chain analysis
-        self.analyze_multi_hop_chains(use_labels, output_prefix)
+        self.analyze_multi_hop_chains(use_labels, output_prefix, n_hops=n_hops)
         
         # Step 13: Save results and visualize
         test_df.to_csv(f'{output_prefix}_pivot_predictions.csv', index=False)
@@ -1788,195 +1797,270 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             diff = (fastrp_f1 - best_method['F1-Score']) * 100
             print(f"  ⚠ FastRP is {abs(diff):.2f}pp {'behind' if diff < 0 else 'ahead of'} best baseline")
     
-    def analyze_multi_hop_chains(self, use_labels: bool, output_prefix: str):
+    def analyze_multi_hop_chains(self, use_labels: bool, output_prefix: str, n_hops: int = 3, use_cache: bool = True):
         """
-        Analyze multi-hop attack chains (A→B→C→D) using Polars for memory-efficient processing.
-        Exports edges from Neo4j, then constructs chains in Python to avoid Neo4j memory limits.
+        Analyze multi-hop attack chains using incremental node-by-node traversal.
+        
+        Args:
+            use_labels: Whether to use attack labels (filter to attacks only)
+            output_prefix: Prefix for output files
+            n_hops: Number of hops to analyze (default: 3, producing 4-node chains A→B→C→D)
+            use_cache: Whether to use cached results for lower hop counts
+        
+        Exports edges from Neo4j, then uses recursive exploration to avoid join explosion.
+        Results are cached so that higher hop counts can reuse lower hop computations.
         """
-        print(f"\n--- Multi-Hop Attack Chain Analysis (Polars) ---")
+        print(f"\n--- Multi-Hop Attack Chain Analysis ({n_hops}-hop chains, Incremental Traversal) ---")
         
         try:
             import polars as pl
+            import pandas as pd
         except ImportError:
-            print("  ⚠ Polars not installed. Run: pip install polars")
+            print("  ⚠ Polars/Pandas not installed. Run: pip install polars pandas")
             return
         
         from collections import defaultdict
         import tempfile
         import os
         
-        output_file = f'{output_prefix}_multi_hop_chains.csv'
+        output_file = f'{output_prefix}_{n_hops}hop_chains.csv'
         
-        # Step 1: Export edges from Neo4j to temporary CSV
-        print("  Step 1: Exporting CONNECTS edges from Neo4j...")
-        temp_edges_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-        temp_edges_path = temp_edges_file.name
-        temp_edges_file.close()
+        # Create cache directory
+        cache_dir = os.path.join(os.path.dirname(output_prefix) or '.', '.chain_cache')
+        os.makedirs(cache_dir, exist_ok=True)
         
-        with self.driver.session(database=self.database) as session:
-            # Export query with all necessary attributes
-            export_query = """
-            MATCH (a:IP)-[r:CONNECTS]->(b:IP)
-            RETURN 
-                a.address as src_ip,
-                b.address as dst_ip,
-                a.subnet as src_subnet,
-                b.subnet as dst_subnet,
-                r.timestamp as timestamp,
-                r.is_attack as is_attack,
-                CASE WHEN r.is_attack = 1 THEN r.tactic ELSE null END as tactic
-            ORDER BY r.timestamp
-            """
-            
-            result = session.run(export_query)
-            
-            # Write to temp CSV
-            import csv
-            with open(temp_edges_path, 'w', newline='') as f:
-                writer = None
-                count = 0
-                for record in result:
-                    if writer is None:
-                        writer = csv.DictWriter(f, fieldnames=record.keys())
-                        writer.writeheader()
-                    writer.writerow(dict(record))
-                    count += 1
-                    if count % 50000 == 0:
-                        print(f"    Exported {count:,} edges...")
-            
-            print(f"  ✓ Exported {count:,} edges to temporary file")
+        # Generate cache key based on parameters
+        cache_params = f"labels={use_labels}_nhops={n_hops}"
+        cache_key = hashlib.md5(cache_params.encode()).hexdigest()
+        cache_file = os.path.join(cache_dir, f'chains_{cache_key}.pkl')
+        edge_cache_file = os.path.join(cache_dir, f'edges_{hashlib.md5(f"labels={use_labels}".encode()).hexdigest()}.pkl')
         
-        try:
-            # Step 2: Load edges with Polars and filter
-            print("  Step 2: Loading edges into Polars...")
-            edges_df = pl.read_csv(temp_edges_path)
-            
-            if use_labels:
-                # Filter to attack edges only
-                edges_df = edges_df.filter(pl.col('is_attack') == 1)
-                print(f"  ✓ Filtered to {len(edges_df):,} attack edges")
+        # Check if we have cached results
+        if use_cache and os.path.exists(cache_file):
+            print(f"  ✓ Loading cached {n_hops}-hop chains from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                all_chains = pickle.load(f)
+            print(f"  ✓ Loaded {len(all_chains):,} chains from cache")
+        else:
+            # Step 1: Load or export edges
+            if use_cache and os.path.exists(edge_cache_file):
+                print(f"  Step 1: Loading cached edge data from {edge_cache_file}...")
+                with open(edge_cache_file, 'rb') as f:
+                    edge_index = pickle.load(f)
+                print(f"  ✓ Loaded edge index with {len(edge_index):,} source nodes from cache")
             else:
-                print(f"  ✓ Loaded {len(edges_df):,} edges (all traffic)")
+                print("  Step 1: Exporting CONNECTS edges from Neo4j...")
+                temp_edges_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+                temp_edges_path = temp_edges_file.name
+                temp_edges_file.close()
+                
+                with self.driver.session(database=self.database) as session:
+                    # Export query with all necessary attributes
+                    export_query = """
+                    MATCH (a:IP)-[r:CONNECTS]->(b:IP)
+                    RETURN 
+                        a.address as src_ip,
+                        b.address as dst_ip,
+                        a.subnet as src_subnet,
+                        b.subnet as dst_subnet,
+                        r.timestamp as timestamp,
+                        r.is_attack as is_attack,
+                        CASE WHEN r.is_attack = 1 THEN r.tactic ELSE null END as tactic
+                    ORDER BY r.timestamp
+                    """
+                    
+                    result = session.run(export_query)
+                    
+                    # Write to temp CSV with progress bar
+                    import csv
+                    with open(temp_edges_path, 'w', newline='') as f:
+                        writer = None
+                        count = 0
+                        with tqdm(desc="    Exporting edges", unit=" edges", unit_scale=True) as pbar:
+                            for record in result:
+                                if writer is None:
+                                    writer = csv.DictWriter(f, fieldnames=record.keys())
+                                    writer.writeheader()
+                                writer.writerow(dict(record))
+                                count += 1
+                                pbar.update(1)
+                    
+                    print(f"  ✓ Exported {count:,} edges to temporary file")
+                
+                # Step 2: Load edges with Pandas and filter
+                print("  Step 2: Loading edges into Pandas...")
+                edges_df = pd.read_csv(temp_edges_path)
+                os.unlink(temp_edges_path)  # Clean up immediately
+                
+                if use_labels:
+                    edges_df = edges_df[edges_df['is_attack'] == 1].copy()
+                    print(f"  ✓ Filtered to {len(edges_df):,} attack edges")
+                else:
+                    print(f"  ✓ Loaded {len(edges_df):,} edges (all traffic)")
+                
+                # Build edge index
+                print("    Building edge index...")
+                edge_index = defaultdict(list)
+                for _, row in tqdm(edges_df.iterrows(), total=len(edges_df), desc="    Indexing edges", unit=" edges"):
+                    edge_info = {
+                        'dst_ip': row['dst_ip'],
+                        'timestamp': row['timestamp'],
+                        'src_subnet': row['src_subnet'],
+                        'dst_subnet': row['dst_subnet'],
+                        'tactic': row.get('tactic') if use_labels else None
+                    }
+                    edge_index[row['src_ip']].append(edge_info)
+                
+                print(f"    ✓ Indexed {len(edge_index):,} source nodes")
+                
+                # Cache the edge index
+                if use_cache:
+                    print(f"    Caching edge index to {edge_cache_file}...")
+                    with open(edge_cache_file, 'wb') as f:
+                        pickle.dump(dict(edge_index), f)
+                    print("    ✓ Edge index cached")
             
-            # Step 3: Build chains using self-joins
-            print("  Step 3: Constructing 3-hop chains via joins...")
+            # Step 3: Build chains using incremental node-by-node traversal
+            print(f"  Step 3: Building {n_hops}-hop chains using incremental traversal...")
             
-            # Prepare edges for joining (rename columns for each hop)
-            hop1 = edges_df.select([
-                pl.col('src_ip').alias('hop1_ip'),
-                pl.col('dst_ip').alias('hop2_ip'),
-                pl.col('src_subnet').alias('hop1_subnet'),
-                pl.col('dst_subnet').alias('hop2_subnet'),
-                pl.col('timestamp').alias('t1'),
-                pl.col('tactic').alias('tactic1') if use_labels else pl.lit(None).alias('tactic1')
-            ])
+            # Recursive exploration function
+            def explore_recursive(current_ip, current_subnet, current_time, path, subnets, timestamps, tactics, depth, max_depth):
+                """
+                Recursively explore chains from current node using pure recursion.
+                Matches the thesis pipeline's incremental traversal methodology.
+                """
+                # Base case: reached desired depth
+                if depth == max_depth:
+                    return [(path, subnets, timestamps, tactics)]
+                
+                # Dead end: no outgoing edges
+                if current_ip not in edge_index:
+                    return []
+                
+                all_chains = []
+                
+                # Explore all valid next hops
+                for edge in edge_index[current_ip]:
+                    next_ip = edge['dst_ip']
+                    next_time = edge['timestamp']
+                    next_subnet = edge['dst_subnet']
+                    next_tactic = edge['tactic']
+                    
+                    # Temporal constraint: must move forward in time
+                    if next_time <= current_time:
+                        continue
+                    
+                    # No cycles: node cannot appear twice
+                    if next_ip in path:
+                        continue
+                    
+                    # RECURSE: explore from next node
+                    sub_chains = explore_recursive(
+                        next_ip, next_subnet, next_time,
+                        path + [next_ip],
+                        subnets + [next_subnet],
+                        timestamps + [next_time],
+                        tactics + [next_tactic],
+                        depth + 1,
+                        max_depth
+                    )
+                    
+                    all_chains.extend(sub_chains)
+                
+                return all_chains
             
-            hop2 = edges_df.select([
-                pl.col('src_ip').alias('hop2_ip'),
-                pl.col('dst_ip').alias('hop3_ip'),
-                pl.col('src_subnet').alias('hop2_subnet_check'),
-                pl.col('dst_subnet').alias('hop3_subnet'),
-                pl.col('timestamp').alias('t2'),
-                pl.col('tactic').alias('tactic2') if use_labels else pl.lit(None).alias('tactic2')
-            ])
+            # Get unique source nodes
+            unique_sources = list(edge_index.keys())
+            print(f"    Exploring from {len(unique_sources):,} starting nodes...")
             
-            hop3 = edges_df.select([
-                pl.col('src_ip').alias('hop3_ip'),
-                pl.col('dst_ip').alias('hop4_ip'),
-                pl.col('src_subnet').alias('hop3_subnet_check'),
-                pl.col('dst_subnet').alias('hop4_subnet'),
-                pl.col('timestamp').alias('t3'),
-                pl.col('tactic').alias('tactic3') if use_labels else pl.lit(None).alias('tactic3')
-            ])
+            # Process nodes with progress bar
+            all_chains = []
+            for start_ip in tqdm(unique_sources, desc=f"    Building {n_hops}-hop chains", unit=" nodes"):
+                # Get subnet for starting IP (from first outgoing edge)
+                start_subnet = edge_index[start_ip][0]['src_subnet'] if edge_index[start_ip] else None
+                
+                # Recursively explore all n-hop chains
+                recursive_chains = explore_recursive(
+                    start_ip, start_subnet, 0,  # Start with time=0
+                    [start_ip], [start_subnet], [0], [],  # Initial path
+                    depth=0, max_depth=n_hops
+                )
+                
+                # Collect chains (will convert format later)
+                all_chains.extend(recursive_chains)
             
-            # Join hop1 → hop2 (B is pivot)
-            print("    Joining hop1 → hop2...")
-            chains = hop1.join(hop2, on='hop2_ip', how='inner')
-            chains = chains.filter(pl.col('t2') > pl.col('t1'))
-            print(f"    Found {len(chains):,} 2-hop paths")
-            
-            # Join → hop3 (C is pivot)
-            print("    Joining hop2 → hop3...")
-            chains = chains.join(hop3, on='hop3_ip', how='inner')
-            chains = chains.filter(pl.col('t3') > pl.col('t2'))
-            print(f"    Found {len(chains):,} 3-hop paths")
-            
-            # Apply constraint: A ≠ C, B ≠ D, A ≠ D
-            print("    Applying uniqueness constraints...")
-            chains = chains.filter(
-                (pl.col('hop1_ip') != pl.col('hop3_ip')) &
-                (pl.col('hop2_ip') != pl.col('hop4_ip')) &
-                (pl.col('hop1_ip') != pl.col('hop4_ip'))
-            )
-            
-            if len(chains) == 0:
-                print("  ⚠ No multi-hop chains found after constraints")
+            if len(all_chains) == 0:
+                print("  ⚠ No multi-hop chains found")
                 return
             
-            print(f"  ✓ Found {len(chains):,} valid 3-hop chains")
+            print(f"  ✓ Found {len(all_chains):,} valid {n_hops}-hop chains")
             
-            # Step 4: Compute timing and prepare output
-            print("  Step 4: Computing timing statistics...")
-            chains = chains.with_columns([
-                ((pl.col('t2') - pl.col('t1')) / 3600.0).alias('hours_to_hop2'),
-                ((pl.col('t3') - pl.col('t2')) / 3600.0).alias('hours_to_hop3')
-            ])
+            # Cache the results
+            if use_cache:
+                print(f"    Caching chains to {cache_file}...")
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(all_chains, f)
+                print("    ✓ Chains cached for future use")
+        
+        # Step 4: Convert chains to dictionary format
+        print("  Step 4: Converting chains to DataFrame format...")
+        
+        def chain_to_dict(path, subnets, timestamps, tactics, max_hops):
+            """Convert recursive chain representation to dictionary with dynamic hop count."""
+            chain = {}
+            for i, (ip, subnet, ts) in enumerate(zip(path, subnets, timestamps), start=1):
+                chain[f'hop{i}_ip'] = ip
+                chain[f'hop{i}_subnet'] = subnet
+                if i == 1:
+                    continue  # No timing for first hop
+                chain[f'hours_to_hop{i}'] = (ts - timestamps[i-2]) / 3600.0
+                if use_labels and i <= len(tactics):
+                    chain[f'tactic{i-1}'] = tactics[i-2]
+            return chain
+        
+        all_chains_dicts = []
+        for path, subnets, timestamps, tactics in tqdm(all_chains, desc="    Converting to DataFrame", unit=" chains"):
+            chain_dict = chain_to_dict(path, subnets, timestamps, tactics, n_hops)
+            all_chains_dicts.append(chain_dict)
+        
+        chains_df = pd.DataFrame(all_chains_dicts)
+        
+        # Convert to Polars for final processing
+        chains = pl.from_pandas(chains_df)
+        
+        # Step 5: Save to CSV
+        print(f"  Step 5: Saving chains to {output_file}...")
+        chains.write_csv(output_file)
+        
+        # Step 6: Compute summary statistics
+        print(f"\n  Chain Timing Statistics:")
+        for hop in range(2, n_hops + 2):  # n_hops produces n+1 nodes
+            col_name = f'hours_to_hop{hop}'
+            if col_name in chains.columns:
+                mean_time = chains[col_name].mean()
+                median_time = chains[col_name].median()
+                print(f"    Mean time to hop {hop}: {mean_time:.2f} hours")
+                print(f"    Median time to hop {hop}: {median_time:.2f} hours")
+        
+        # Step 7: Tactic sequence analysis (label-aware only)
+        if use_labels:
+            print(f"\n  Most Common Tactic Sequences:")
+            # Build dynamic tactic columns list
+            tactic_cols = [f'tactic{i}' for i in range(1, n_hops + 1) if f'tactic{i}' in chains.columns]
             
-            # Select final columns
-            if use_labels:
-                output_cols = [
-                    'hop1_ip', 'hop2_ip', 'hop3_ip', 'hop4_ip',
-                    'hop1_subnet', 'hop2_subnet', 'hop3_subnet', 'hop4_subnet',
-                    'hours_to_hop2', 'hours_to_hop3',
-                    'tactic1', 'tactic2', 'tactic3'
-                ]
-            else:
-                output_cols = [
-                    'hop1_ip', 'hop2_ip', 'hop3_ip', 'hop4_ip',
-                    'hop1_subnet', 'hop2_subnet', 'hop3_subnet', 'hop4_subnet',
-                    'hours_to_hop2', 'hours_to_hop3'
-                ]
-            
-            chains = chains.select(output_cols)
-            
-            # Step 5: Save to CSV
-            print(f"  Step 5: Saving chains to {output_file}...")
-            chains.write_csv(output_file)
-            
-            # Step 6: Compute summary statistics
-            print(f"\n  Chain Timing Statistics:")
-            mean_h2 = chains['hours_to_hop2'].mean()
-            mean_h3 = chains['hours_to_hop3'].mean()
-            median_h2 = chains['hours_to_hop2'].median()
-            median_h3 = chains['hours_to_hop3'].median()
-            
-            print(f"    Mean time to 2nd hop: {mean_h2:.2f} hours")
-            print(f"    Mean time to 3rd hop: {mean_h3:.2f} hours")
-            print(f"    Median time to 2nd hop: {median_h2:.2f} hours")
-            print(f"    Median time to 3rd hop: {median_h3:.2f} hours")
-            
-            # Step 7: Tactic sequence analysis (label-aware only)
-            if use_labels:
-                print(f"\n  Most Common Tactic Sequences:")
+            if tactic_cols:
                 tactic_counts = (
-                    chains.group_by(['tactic1', 'tactic2', 'tactic3'])
+                    chains.group_by(tactic_cols)
                     .agg(pl.len().alias('count'))
                     .sort('count', descending=True)
                     .head(5)
                 )
                 for row in tactic_counts.iter_rows(named=True):
-                    t1 = row['tactic1'] or 'None'
-                    t2 = row['tactic2'] or 'None'
-                    t3 = row['tactic3'] or 'None'
-                    print(f"    {t1} → {t2} → {t3}: {row['count']:,} chains")
-            
-            print(f"\n  ✓ Analysis complete. Results saved to {output_file}")
-            
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_edges_path):
-                os.unlink(temp_edges_path)
-                print(f"  ✓ Cleaned up temporary edge export")
+                    tactic_seq = ' → '.join([row.get(col) or 'None' for col in tactic_cols])
+                    print(f"    {tactic_seq}: {row['count']:,} chains")
+        
+        print(f"\n  ✓ Analysis complete. Results saved to {output_file}")
+        print(f"  💾 Cached data available at {cache_dir}")
     
     def compare_analysis_modes(self):
         """Compare label-aware vs label-agnostic analysis results."""
