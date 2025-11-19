@@ -6,9 +6,9 @@
 
 Advanced Persistent Threats (APTs) persist inside enterprise networks long enough to escalate privileges and execute lateral movement well after their initial reconnaissance. Alerting systems routinely flag reconnaissance bursts but rarely identify which victims will pivot next, forcing defenders into reactive containment. This thesis presents a graph-native prediction workflow that elevates reconnaissance triage by pairing Neo4j graph analytics with FastRP graph neural network embeddings to forecast impending pivots.
 
-The pipeline ingests 1,898,613 labeled Zeek telemetry edges from the UWF-ZeekData24 corpus into Neo4j, exports the full CONNECTS graph via APOC, and streams those edges into Polars for memory-efficient, time-aware processing without sampling constraints. Within the notebook orchestrator the label-aware branch constructs all four-hop chains exclusively from MITRE ATT&CK attack edges, while the label-agnostic branch applies a burst-based heuristic to retain parity in unlabeled environments. Both branches emit synchronized artifacts: complete Polars-derived chain datasets with /24 annotations, unlimited IP-level and /24 subnet visualizations rendered through NetworkX/Matplotlib, and hop-aware chain network diagrams that surface the structural choke points most frequently weaponized by adversaries. By leveraging Polars' lazy evaluation and streaming capabilities, the pipeline processes the full chain space without arbitrary limits, enabling comprehensive analysis of multi-hop attack propagation patterns.
+The pipeline ingests 1,898,613 labeled Zeek telemetry edges from the UWF-ZeekData24 corpus into Neo4j, exports the full CONNECTS graph via the Awesome Procedures on Cypher (APOC) library, and streams those edges into Polars for memory-efficient, time-aware processing without sampling constraints. Within the notebook orchestrator the label-aware branch constructs all four-hop chains exclusively from MITRE ATT&CK attack edges, while the label-agnostic branch applies a burst-based heuristic to retain parity in unlabeled environments. Both branches emit synchronized artifacts: complete Polars-derived chain datasets with /24 annotations, unlimited IP-level and /24 subnet visualizations rendered through NetworkX/Matplotlib, and hop-aware chain network diagrams that surface the structural choke points most frequently weaponized by adversaries. By leveraging Polars' lazy evaluation and streaming capabilities, the pipeline processes the full chain space without arbitrary limits, enabling comprehensive analysis of multi-hop attack propagation patterns.
 
-For the label-aware configuration (48-hour historical window, 24-hour detection window) FastRP similarity to a pivot prototype reaches an AUC-ROC of 0.676 and an AUC-PR of 0.979, delivering precision 0.948, recall 1.000, and F1-score 0.974. Welch’s t-test on the most recent run (2025-11-06 15:03 UTC) reports t = 71.36 with p < 1e-300 and Cohen’s d = 1.16, confirming that pivot embeddings cluster far closer to the prototype than non-pivots. The label-agnostic mode yields 589,662 candidate windows, maintains artifact completeness with a 99.74% pivot rate, and preserves discriminative value through a 0.998 AUC-PR despite a limited 0.550 AUC-ROC (Cohen’s d = 0.13, p = 1.8e-6). Collectively, these results show that structural context combined with the refreshed Polars visualization stack equips analysts to prioritize reconnaissance victims, reason about subnet-level exposure, and study multi-day kill chains with reproducible outputs from a single orchestrated workflow.
+For the label-aware configuration (48-hour historical window, 24-hour detection window) FastRP similarity to a pivot prototype reaches an AUC-ROC of 0.615 and an AUC-PR of 0.974, delivering precision 0.949, recall 1.000, and F1-score 0.974. Welch’s t-test on the most recent run (2025-11-19) reports t = 50.59 with p < 1e-300 and Cohen’s d = 0.73, confirming that pivot embeddings cluster closer to the prototype than non-pivots. The label-agnostic mode yields 589,662 candidate windows, maintains artifact completeness with a 99.74% pivot rate, and preserves discriminative value through a 0.997 AUC-PR despite a limited 0.422 AUC-ROC (Cohen’s d = -0.32). Collectively, these results show that structural context combined with the refreshed Polars visualization stack equips analysts to prioritize reconnaissance victims, reason about subnet-level exposure, and study multi-day kill chains with reproducible outputs from a single orchestrated workflow.
 
 **Keywords**: Advanced Persistent Threats, Lateral Movement, Graph Neural Networks, Pivot Prediction, MITRE ATT&CK, Neo4j, Zeek Telemetry
 
@@ -18,9 +18,9 @@ For the label-aware configuration (48-hour historical window, 24-hour detection 
 
 ### **1.1 Background and Motivation**
 
-Modern defenders confront APT campaigns that blend stealthy reconnaissance with selective lateral movement. Zeek telemetry and ATT&CK-aligned analytics can enumerate the tactics in play, but security operations centers (SOCs) still face a triage bottleneck: which reconnaissance victims deserve immediate containment before adversaries pivot deeper into the network? Treating every reconnaissance alert identically fuels analyst fatigue and delays response actions.
+Modern defenders confront Advanced Persistent Threat (APT) campaigns that blend stealthy reconnaissance with selective lateral movement—the technique adversaries use to move through a network in search of key assets and data. Zeek telemetry and MITRE ATT&CK-aligned analytics can enumerate the tactics in play, but Security Operations Centers (SOCs)—centralized units that deal with security issues on an organizational and technical level—still face a triage bottleneck: which reconnaissance victims deserve immediate containment before adversaries pivot deeper into the network? Treating every reconnaissance alert identically fuels analyst fatigue and delays response actions.
 
-Network graphs expose the structural context that adversaries exploit. Nodes bridging multiple subnets or holding high centrality are attractive pivots because compromising them opens additional targets. Graph Neural Networks capture these structural signatures through neighborhood aggregation, offering a data-driven path to estimate pivot risk ahead of observable lateral movement.
+Network graphs expose the structural context that adversaries exploit. Nodes bridging multiple subnets or holding high centrality are attractive pivots because compromising them opens additional targets. Graph Neural Networks (GNNs)—deep learning models designed to process data represented as graphs—capture these structural signatures through neighborhood aggregation, offering a data-driven path to estimate pivot risk ahead of observable lateral movement.
 
 ### **1.2 Problem Statement**
 
@@ -75,7 +75,7 @@ Zeek (formerly Bro) exports connection-level metadata that supports statistical 
 
 ### **2.3 Graph-Based Intrusion Detection**
 
-Graph analytics have been applied to lateral movement detection, insider threat analysis, and malware campaign clustering. Hussain et al. (2024) applied Graph Convolutional Networks (GCNs) to classify malicious network edges in synthetic lateral movement scenarios, achieving 87% F1-score by encoding both structural and temporal features. Li et al. (2021) used graph embeddings to detect malicious domains in DNS query graphs, demonstrating that structural network properties can identify command-and-control infrastructure with 94% accuracy. Hou et al. (2017) proposed HinDroid, leveraging heterogeneous information networks to detect Android malware through structural patterns in API call graphs. Most approaches classify behavior after it occurs. The pivot prediction problem tackled here differs by forecasting a role transition (victim to attacker) before the offensive activity is observed and by demonstrating the operational trade-offs when labels are absent.
+Graph analytics have been applied to lateral movement detection, insider threat analysis, and malware campaign clustering. Hussain et al. (2024) applied Graph Convolutional Networks (GCNs) to classify malicious network edges in synthetic lateral movement scenarios, achieving 87% F1-score by encoding both structural and temporal features. Li et al. (2021) used graph embeddings to detect malicious domains in Domain Name System (DNS) query graphs, demonstrating that structural network properties can identify command-and-control infrastructure with 94% accuracy. Hou et al. (2017) proposed HinDroid, leveraging heterogeneous information networks to detect Android malware through structural patterns in Application Programming Interface (API) call graphs. Most approaches classify behavior after it occurs. The pivot prediction problem tackled here differs by forecasting a role transition (victim to attacker) before the offensive activity is observed and by demonstrating the operational trade-offs when labels are absent.
 
 ### **2.4 Graph Neural Networks and Embedding Methods**
 
@@ -114,7 +114,9 @@ Each `IP` node stores the IPv4 address, derived subnet, and numeric `subnet_id`.
 
 ### **3.4 FastRP Embedding Generation**
 
-The Neo4j Graph Data Science (GDS) library generates 128-dimensional FastRP embeddings. Four propagation layers with uniform iteration weights capture increasingly broader neighborhoods. Embeddings are L2-normalized, enabling cosine similarity calculations. A fixed random seed guarantees reproducibility across runs, and the embeddings are written back to each node with distinct properties for label-aware and label-agnostic analyses.
+The Neo4j Graph Data Science (GDS) library generates 128-dimensional Fast Random Projection (FastRP) embeddings. FastRP is a scalable node embedding algorithm that preserves high-order proximity between nodes by iteratively projecting the graph's adjacency matrix into a lower-dimensional space. Unlike random walk-based methods (e.g., node2vec) that sample paths, FastRP uses sparse random projections to approximate the diffusion of information across the graph, capturing both local neighborhood structure and global community properties efficiently.
+
+Four propagation layers with uniform iteration weights capture increasingly broader neighborhoods. Embeddings are L2-normalized, enabling cosine similarity calculations. A fixed random seed guarantees reproducibility across runs, and the embeddings are written back to each node with distinct properties for label-aware and label-agnostic analyses.
 
 ### **3.5 Pivot Scoring Logic**
 
@@ -127,7 +129,7 @@ The Neo4j Graph Data Science (GDS) library generates 128-dimensional FastRP embe
 Traditional graph databases excel at traversal queries but face memory constraints when materializing large result sets. To overcome Neo4j's limitations on complex multi-hop pattern matching, the pipeline exports the complete edge list via APOC and delegates chain construction to Polars. The workflow proceeds as follows:
 
 1. **Export Phase**: APOC's CSV export writes all `CONNECTS` edges with source IP, destination IP, timestamp, and attack labels to a flat file accessible from both the container and host filesystem.
-2. **Lazy Loading**: Polars' `scan_csv` creates a LazyFrame without loading data into memory, enabling query optimization across subsequent operations.
+2. **Lazy Loading**: Polars' `scan_csv` creates a LazyFrame without loading data into memory. Lazy evaluation allows Polars to build a query plan, optimize it (e.g., by pushing down filters to the scan level), and execute it only when results are collected, enabling the processing of datasets larger than available RAM.
 3. **Dynamic Hop Construction**: For each chain depth n (from 2 to 10 hops), the pipeline dynamically constructs n hop frames and performs incremental self-joins on IP addresses. For an n-hop chain, n+1 unique IPs participate (e.g., 4-hop requires 5 IPs: A→B→C→D→E). Each join enforces temporal constraints (timestamps must increase) and uniqueness constraints (no IP appears twice).
 4. **Iterative Join Strategy**: Rather than constructing all chains simultaneously, the pipeline builds 2-hop chains, then extends to 3-hop, then 4-hop, etc. This approach reuses intermediate results and applies filtering at each stage to prune the search space. Polars' columnar execution and predicate pushdown minimize memory footprint during join operations.
 5. **Streaming Collection**: When each chain query executes, Polars streams results in batches, writing directly to hop-specific CSV files without accumulating the full dataset in RAM. This approach scales to millions of chains per hop depth on commodity hardware.
@@ -197,7 +199,14 @@ ORDER BY pivot_subnet, timestamp
 
 ### **3.7 Evaluation Metrics and Statistical Tests**
 
-Performance is assessed using accuracy, precision, recall, F1-score, AUC-ROC, and AUC-PR. Because the dataset is highly imbalanced, AUC-PR and threshold-independent comparisons carry more weight than accuracy alone. Welch's t-test evaluates H1 by comparing similarity distributions between pivot and non-pivot groups, and Cohen's d quantifies effect size. All results reported in Chapter 4 stem from the 2025-11-06 analysis run stored under `thesis_results/run_20251106_150318_h48_d24`.
+Performance is assessed using a suite of standard classification metrics:
+
+*   **AUC-ROC (Area Under the Receiver Operating Characteristic Curve)**: Measures the ability of the model to distinguish between classes across all decision thresholds. A value of 0.5 represents random guessing, while 1.0 represents perfect classification.
+*   **AUC-PR (Area Under the Precision-Recall Curve)**: Summarizes the trade-off between precision (positive predictive value) and recall (sensitivity). Because the dataset is highly imbalanced (pivots are rare or frequent depending on the view), AUC-PR provides a more reliable performance indicator than AUC-ROC.
+*   **Welch's t-test**: A statistical test used to compare the means of two independent groups (pivot vs. non-pivot embeddings) without assuming equal population variances. It tests the null hypothesis that the two groups have the same mean similarity to the prototype.
+*   **Cohen's d**: A measure of effect size that quantifies the difference between two means in terms of standard deviations. A value of 0.2 is considered small, 0.5 medium, and 0.8 large. This metric helps determine if the statistical significance observed in the t-test translates to a practical, meaningful difference in embedding space.
+
+All results reported in Chapter 4 stem from the 2025-11-19 analysis run stored under `thesis_results/run_20251119_194956_h48_d24`.
 
 ---
 
@@ -218,33 +227,33 @@ The label-aware visualization panel summarizes class balance, similarity distrib
 ![Mode comparison dashboard](thesis_results/run_20251106_150318_h48_d24/mode_comparison.png)
 The mode comparison chart contrasts label-aware and label-agnostic performance, revealing how the heuristic inflates the pivot rate while preserving precision-recall dominance.
 
-### **4.2 Label-Aware Mode Performance**
+### 4.2 Label-Aware Mode Performance
 
 | Metric | Value |
 | --- | ---: |
 | Samples | 28,692 |
 | Pivot rate | 94.85% |
-| FastRP AUC-ROC | 0.676 |
-| FastRP AUC-PR | 0.979 |
-| Precision / Recall / F1 | 0.948 / 1.000 / 0.974 |
-| Welch's t (similarity) | 71.36 |
-| Cohen's d | 1.16 |
-| Mean similarity (pivot vs non) | 0.450 vs 0.239 |
+| FastRP AUC-ROC | 0.615 |
+| FastRP AUC-PR | 0.974 |
+| Precision / Recall / F1 | 0.949 / 1.000 / 0.974 |
+| Welch's t (similarity) | 50.59 |
+| Cohen's d | 0.73 |
+| Mean similarity (pivot vs non) | 0.432 vs 0.317 |
 
 Structural baselines trail FastRP in discriminative power: burst score delivers the strongest AUC-ROC among baselines (0.716), clustering coefficient reaches 0.679, and connection velocity achieves 0.662. Nevertheless, each baseline shares the same threshold-derived precision and recall because the dataset is heavily skewed toward pivots; the similarity score adds rank-order differentiation absent from single-threshold metrics.
 
-### **4.3 Label-Agnostic Mode Performance**
+### 4.3 Label-Agnostic Mode Performance
 
 | Metric | Value |
 | --- | ---: |
 | Samples | 589,662 |
 | Pivot rate | 99.74% |
-| FastRP AUC-ROC | 0.550 |
-| FastRP AUC-PR | 0.998 |
+| FastRP AUC-ROC | 0.422 |
+| FastRP AUC-PR | 0.997 |
 | Precision / Recall / F1 | 0.997 / 1.000 / 0.999 |
-| Welch's t (similarity) | 4.80 |
-| Cohen's d | 0.13 |
-| Mean similarity (pivot vs non) | 0.276 vs 0.262 |
+| Welch's t (similarity) | -12.13 |
+| Cohen's d | -0.32 |
+| Mean similarity (pivot vs non) | 0.224 vs 0.278 |
 
 The heuristic inflates the positive class, making ROC discrimination challenging. FastRP still slightly surpasses PageRank and betweenness, while connection velocity (0.717 AUC-ROC) and subnet size (0.697 AUC-ROC) capture temporal and structural bursts more effectively under the heuristic definition. These outcomes emphasize the operational cost of ensuring artifact completeness without label guidance.
 
@@ -268,7 +277,7 @@ By removing arbitrary sampling limits and utilizing Polars for scalable datafram
 
 ### **4.5 Case Studies**
 
-- **Persistent Pivot: 143.88.11.0/24** – Hosts in this subnet maintain average FastRP similarity scores above 0.60 and repeatedly launch Credential Access campaigns. They exemplify the structural risk associated with subnets bridging multiple VLANs.
+- **Persistent Pivot: 143.88.11.0/24** – Hosts in this subnet maintain average FastRP similarity scores above 0.60 and repeatedly launch Credential Access campaigns. They exemplify the structural risk associated with subnets bridging multiple Virtual Local Area Networks (VLANs).
 - **Dormant Reconnaissance Target: 143.88.10.0/24** – Despite 1,181 reconnaissance windows, the subnet's mean similarity stays below 0.10, and no pivots occur. This validates the model's ability to suppress structurally isolated enclaves.
 - **Heuristic Inflation: 143.88.13.0/24** – In label-agnostic mode the heuristic classifies nearly all windows as pivots because bursty outbound traffic is common. Analysts should treat these scores as ranking signals and correlate them with external telemetry (e.g., SOC tickets) before automation.
 
@@ -320,17 +329,17 @@ The visualization pipeline now exports a consistent set of artifacts to `thesis_
 
 ## **Chapter 5: Discussion**
 
-### **5.1 Interpretation of Findings**
+### 5.1 Interpretation of Findings
 
-The label-aware experiments confirm H1: structural embeddings encode meaningful cues about impending lateral movement. The effect size above 1.0 indicates substantial separation between classes. However, even in the labeled setting FastRP's AUC-ROC falls short of the 0.80 goal, suggesting that augmenting structure with temporal or behavioral features could further improve discrimination.
+The label-aware experiments confirm H1: structural embeddings encode meaningful cues about impending lateral movement. The effect size of 0.73 indicates medium-to-large separation between classes. However, even in the labeled setting FastRP's AUC-ROC falls short of the 0.80 goal, suggesting that augmenting structure with temporal or behavioral features could further improve discrimination.
 
-In the label-agnostic setting the heuristic successfully drives artifact creation but at the expense of calibration. Nearly identical threshold metrics across methods reveal that accuracy alone is uninformative under extreme imbalance. The modest effect size and tight similarity range highlight the need for adaptive thresholds or unsupervised clustering to parse high-risk subsets.
+In the label-agnostic setting the heuristic successfully drives artifact creation but at the expense of calibration. Nearly identical threshold metrics across methods reveal that accuracy alone is uninformative under extreme imbalance. The negative effect size (-0.32) indicates that the heuristic captures a broad set of behaviors where structural similarity to a "pivot prototype" is less predictive, highlighting the need for adaptive thresholds or unsupervised clustering to parse high-risk subsets.
 
 ### **5.2 Operational Implications**
 
 - **Alert Enrichment**: SOCs can enrich reconnaissance alerts with FastRP similarity, burst score, and subnet statistics, prioritizing the limited set of subnets that repeatedly weaponize.
 - **Containment Playbooks**: Subnets with sustained high similarity should trigger automated containment or deeper forensic collection within the first 40 hours, matching the observed multi-hop cadence.
-- **Label-Agnostic Deployments**: The heuristic ensures visibility but should be paired with analyst-driven validation and, ideally, secondary indicators (EDR telemetry, authentication logs) to avoid overwhelm.
+- **Label-Agnostic Deployments**: The heuristic ensures visibility but should be paired with analyst-driven validation and, ideally, secondary indicators (Endpoint Detection and Response [EDR] telemetry, authentication logs) to avoid overwhelm.
 
 ### **5.3 Limitations**
 
@@ -346,8 +355,8 @@ In the label-agnostic setting the heuristic successfully drives artifact creatio
 | Hussain et al. (2024) | Lateral movement edge classification | Synthetic | 87% F1 |
 | Li et al. (2021) | Malicious domain detection | Real DNS logs | 94% accuracy |
 | Ring et al. (2019) | Zeek anomaly detection | Real Zeek logs | 82% accuracy, 18% FPR |
-| **This work (label-aware)** | Pivot prediction | UWF-ZeekData24 | 0.979 AUC-PR, 0.676 AUC-ROC |
-| **This work (label-agnostic)** | Heuristic pivot prediction | UWF-ZeekData24 | 0.998 AUC-PR, 0.550 AUC-ROC |
+| **This work (label-aware)** | Pivot prediction | UWF-ZeekData24 | 0.974 AUC-PR, 0.615 AUC-ROC |
+| **This work (label-agnostic)** | Heuristic pivot prediction | UWF-ZeekData24 | 0.997 AUC-PR, 0.422 AUC-ROC |
 
 This thesis distinguishes itself by forecasting role changes before offensive behavior manifests and by openly documenting the performance trade-offs when ATT&CK labels are unavailable.
 
@@ -355,16 +364,16 @@ This thesis distinguishes itself by forecasting role changes before offensive be
 
 ## **Chapter 6: Conclusion and Future Work**
 
-### **6.1 Summary of Contributions**
+### 6.1 Summary of Contributions
 
 1. Delivered a reproducible Neo4j-based pipeline that transforms Zeek telemetry into graph analytics artifacts for both label-aware and label-agnostic scenarios.
-2. Demonstrated that FastRP embeddings provide a strong structural signal for pivot prediction, achieving 0.979 AUC-PR and large effect sizes in the labeled setting.
+2. Demonstrated that FastRP embeddings provide a strong structural signal for pivot prediction, achieving 0.974 AUC-PR and medium-to-large effect sizes in the labeled setting.
 3. Implemented a pragmatic heuristic that maintains artifact generation without labels, clarifying the limitations and calibration needs of purely structural approaches in high-noise environments.
 4. Quantified adversary dwell time through multi-hop chain extraction, offering actionable timelines for SOC containment strategies.
 
-### **6.2 Hypothesis Evaluation**
+### 6.2 Hypothesis Evaluation
 
-- **H1**: Supported in the label-aware dataset (t = 71.36, p < 1e-300, d = 1.16). Partially supported under heuristics (t = 4.80, d = 0.13) where structure alone provides limited separation.
+- **H1**: Supported in the label-aware dataset (t = 50.59, p < 1e-300, d = 0.73). Not supported under heuristics (t = -12.13, d = -0.32) where structure alone provides limited separation and non-pivots actually exhibited slightly higher similarity to the prototype.
 - **H2**: Supported qualitatively; pivot-heavy subnets exhibit higher centrality and burst metrics, while dormant subnets remain structurally isolated.
 - **H3**: Partially supported. The heuristic ensures coverage but requires additional signals to achieve robust discrimination.
 
