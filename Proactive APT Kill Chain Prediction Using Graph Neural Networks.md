@@ -332,6 +332,8 @@ The label-aware mode represents the "ideal" scenario where defenders have perfec
 | **Welch's t** | 50.59 | Extremely significant difference between group means. |
 | **Cohen's d** | 0.73 | Medium-to-large effect size, confirming structural separation. |
 | **Mean Similarity** | 0.432 vs 0.317 | Pivots are structurally closer to the prototype than non-pivots. |
+| **Note** |
+**On Recall = 1.0:** The perfect recall (1.000) observed here is a direct consequence of the extreme class imbalance in the dataset, where nearly all reconnaissance windows transition into pivots. This means the model identifies every actual pivot, but it does not imply perfect overall performance or that the model is infallible. In such imbalanced scenarios, recall alone can be misleading; it must be interpreted alongside precision, AUC-ROC, and effect size metrics to understand true discriminative power.
 
 **Statistical Significance of Structural Separation**
 The most critical finding in this section is the statistical validation of the embeddings. The Welch's t-test yields a t-statistic of 50.59 with a p-value effectively zero (p < 1e-300). This confirms that the difference in mean similarity scores between pivots (0.432) and non-pivots (0.317) is not due to random chance. Furthermore, the Cohen's d value of 0.73 indicates a "medium-to-large" effect size. In practical terms, this means that the structural "shape" of a pivot node—as captured by FastRP—is distinct enough from a non-pivot node to be used as a reliable predictive signal.
