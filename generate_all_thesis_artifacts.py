@@ -121,6 +121,92 @@ def plot_effect_size_forest(df, output_path):
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
+def plot_multi_hop_subnet_grid(run_dir, output_path):
+    """Generate multi-hop subnet transition grid from chain summary data."""
+    run_path = Path(run_dir)
+    
+    # Look for chain summary files in run directory
+    chain_summaries = list(run_path.glob("*all_chains_summary.json"))
+    if not chain_summaries:
+        print("  ⚠ No chain summary files found, cannot generate multi-hop subnet grid")
+        print(f"     Expected: *all_chains_summary.json in {run_path}")
+        return
+    
+    print(f"  Found {len(chain_summaries)} chain summary file(s)")
+    
+    # Parse chain data from summary
+    hop_stats = {}
+    for summary_file in chain_summaries:
+        try:
+            with open(summary_file, 'r') as f:
+                data = json.load(f)
+                # Extract hop-level statistics
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if 'hop' in key.lower() and isinstance(value, dict):
+                            hop_num = int(''.join(filter(str.isdigit, key)))
+                            if 'total_chains' in value or 'chain_count' in value:
+                                hop_stats[hop_num] = value
+        except Exception as e:
+            print(f"  ⚠ Error reading {summary_file.name}: {e}")
+    
+    if not hop_stats:
+        print("  ⚠ No hop statistics found in chain summaries")
+        return
+    
+    # Create visualization grid
+    hop_depths = sorted(hop_stats.keys())
+    num_hops = min(len(hop_depths), 9)  # Cap at 9 for grid layout
+    
+    cols = 3
+    rows = (num_hops + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+    if num_hops == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    for idx in range(rows * cols):
+        row = idx // cols
+        col = idx % cols
+        ax = axes[row, col]
+        
+        if idx < num_hops:
+            hop_depth = hop_depths[idx]
+            stats = hop_stats[hop_depth]
+            
+            # Extract transition count
+            transition_count = (
+                stats.get('total_chains', 0) or 
+                stats.get('chain_count', 0) or
+                stats.get('unique_chains', 0) or
+                0
+            )
+            
+            # Create a simple bar chart showing the count
+            ax.bar([f'{hop_depth}-hop'], [transition_count], color='steelblue', alpha=0.7)
+            ax.set_title(f'{hop_depth}-Hop Chains', fontweight='bold', fontsize=11)
+            ax.set_ylabel('Chain Count', fontsize=9)
+            ax.ticklabel_format(style='plain', axis='y')
+            
+            # Add count annotation
+            if transition_count > 0:
+                ax.text(0, transition_count, f'{transition_count:,}', 
+                       ha='center', va='bottom', fontsize=9, fontweight='bold')
+            
+            ax.grid(axis='y', alpha=0.3)
+        else:
+            ax.axis('off')
+    
+    plt.suptitle('Multi-Hop Chain Distribution by Depth', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Generated multi-hop subnet grid ({num_hops} hop depths)")
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python generate_all_thesis_artifacts.py <run_dir>")
@@ -144,6 +230,10 @@ def main():
         
     else:
         print("Label-aware predictions not found.")
+    
+    # Generate multi-hop subnet grid visualization
+    print("Generating multi-hop subnet grid...")
+    plot_multi_hop_subnet_grid(run_dir, output_dir / 'multi_hop_subnet_grid.png')
 
     print("Artifact generation complete.")
 
