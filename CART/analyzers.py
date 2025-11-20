@@ -1,5 +1,6 @@
 from .base import Neo4jConnection
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Union, Iterable
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import networkx as nx
@@ -19,6 +20,8 @@ import pickle
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
+import multiprocessing
+import bisect
 
 try:
     import polars as pl
@@ -26,6 +29,78 @@ except ImportError:
     pl = None
 
 warnings.filterwarnings('ignore')
+
+# Global variables for worker processes
+_global_subnet_features = None
+_global_pivot_behaviors = None
+
+def _init_worker(subnet_features, pivot_behaviors):
+    """Initialize worker with shared read-only data."""
+    global _global_subnet_features, _global_pivot_behaviors
+    _global_subnet_features = subnet_features
+    _global_pivot_behaviors = pivot_behaviors
+
+def _process_event_chunk(events):
+    """Process a chunk of events using shared global data."""
+    results = []
+    
+    for event in events:
+        subnet = event['victim_subnet']
+        recon_time = event['recon_time']
+        
+        # Get features from pre-fetched data
+        features = _global_subnet_features.get(subnet)
+        if not features or not features['embeddings']:
+            continue
+        
+        # Get pivot info from pre-fetched data
+        pivot_key = (subnet, recon_time)
+        pivot_info = _global_pivot_behaviors.get(pivot_key, {
+            'became_pivot': False,
+            'attack_count': 0,
+            'pivot_ips': []
+        })
+        
+        # Average embeddings
+        avg_embedding = np.mean(features['embeddings'], axis=0)
+        
+        results.append({
+            'subnet': subnet,
+            'recon_time': recon_time,
+            'embedding': avg_embedding,
+            'became_pivot': pivot_info['became_pivot'],
+            'attack_count': pivot_info['attack_count'],
+            'pivot_ips': pivot_info['pivot_ips'],
+            'subnet_size': features['subnet_size'],
+            'avg_pagerank': features['avg_pagerank'],
+            'max_pagerank': features['max_pagerank'],
+            'avg_betweenness': features['avg_betweenness'],
+            'max_betweenness': features['max_betweenness'],
+            'avg_clustering': features['avg_clustering'],
+            'avg_velocity': features['avg_velocity'],
+            'max_velocity': features['max_velocity'],
+            'avg_burst': features['avg_burst']
+        })
+    
+    return results
+
+
+def _normalize_hop_lengths(hops: Union[int, Iterable[int], None]) -> List[int]:
+    """Normalize hop configuration input into a sorted list of unique positive ints."""
+    if hops is None:
+        return [3]
+
+    if isinstance(hops, int):
+        hop_values = [hops]
+    elif isinstance(hops, Iterable) and not isinstance(hops, (str, bytes)):
+        hop_values = list(hops)
+    else:
+        raise ValueError(f"Unsupported hop configuration: {hops!r}")
+
+    normalized = sorted({int(h) for h in hop_values if int(h) >= 1})
+    if not normalized:
+        raise ValueError("At least one hop length >= 1 is required")
+    return normalized
 
 
 class TemporalWindowAnalyzer(Neo4jConnection):
@@ -84,7 +159,7 @@ class TemporalWindowAnalyzer(Neo4jConnection):
             print("Shared connection managed by controller; not closing driver here.")
             return
         return super().close()
-    
+
     def run_analysis(self, output_filepath="temporal_window_analysis.json"):
         """Runs comprehensive temporal window analysis."""
         try:
@@ -741,8 +816,16 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             session.run("CREATE INDEX subnet_id_index IF NOT EXISTS FOR (n:IP) ON (n.subnet_id)")
             print("  ✓ Subnet indices created")
     
-    def run_full_analysis(self, mode='both', historical_window_hours=24, 
-                         detection_window_hours=24, embedding_dim=128, n_hops=3):
+    def run_full_analysis(
+        self,
+        mode='both',
+        historical_window_hours=24,
+        detection_window_hours=24,
+        embedding_dim=128,
+        n_hops: Union[int, Iterable[int]] = 3,
+        chain_output_format: str = 'parquet',
+        workers: int = 1,
+    ):
         """
         Run complete subnet-aware pivot prediction analysis.
         
@@ -752,6 +835,7 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             detection_window_hours: Hours after reconnaissance to check for pivot behavior
             embedding_dim: Dimension of FastRP embeddings
             n_hops: Number of hops for multi-hop chain analysis (default: 3)
+            chain_output_format: 'parquet' (default) or 'jsonl' for streaming batches
         """
         try:
             if not self.connect():
@@ -765,7 +849,9 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             print(f"  Historical window: {historical_window_hours} hours")
             print(f"  Detection window: {detection_window_hours} hours")
             print(f"  Embedding dimension: {embedding_dim}")
-            print(f"  Multi-hop chain depth: {n_hops} hops")
+            hop_lengths = _normalize_hop_lengths(n_hops)
+            hop_desc = ', '.join(f"{h}-hop" for h in hop_lengths)
+            print(f"  Multi-hop chain depths: {hop_desc}")
             
             # Add subnet labels if not already present
             self.add_subnet_labels()
@@ -781,7 +867,9 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     detection_window_hours=detection_window_hours,
                     embedding_dim=embedding_dim,
                     output_prefix='label_aware',
-                    n_hops=n_hops
+                    chain_hops=hop_lengths,
+                    chain_output_format=chain_output_format,
+                    workers=workers,
                 )
             
             if mode in ['label_agnostic', 'both']:
@@ -794,7 +882,9 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     detection_window_hours=detection_window_hours,
                     embedding_dim=embedding_dim,
                     output_prefix='label_agnostic',
-                    n_hops=n_hops
+                    chain_hops=hop_lengths,
+                    chain_output_format=chain_output_format,
+                    workers=workers,
                 )
             
             # Compare results if both modes were run
@@ -1251,10 +1341,20 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 'avg_burst': float(result['avg_burst'] or 0)
             }
     
-    def run_pivot_prediction(self, use_labels: bool, historical_window_hours: int,
-                            detection_window_hours: int, embedding_dim: int,
-                            output_prefix: str, n_hops: int = 3):
+    def run_pivot_prediction(
+        self,
+        use_labels: bool,
+        historical_window_hours: int,
+        detection_window_hours: int,
+        embedding_dim: int,
+        output_prefix: str,
+        chain_hops: Union[int, Iterable[int]] = 3,
+        chain_output_format: str = 'parquet',
+        workers: int = 1,
+    ):
         """Run the complete pivot prediction pipeline."""
+
+        hop_lengths = _normalize_hop_lengths(chain_hops)
         
         # Step 1: Create graph projection
         projection_name = f"pivot_graph_{'labeled' if use_labels else 'unlabeled'}"
@@ -1371,8 +1471,14 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         # Step 11: Baseline comparison
         self.compare_with_baselines(test_df, output_prefix)
         
-        # Step 12: Multi-hop chain analysis
-        self.analyze_multi_hop_chains(use_labels, output_prefix, n_hops=n_hops)
+        # Step 12: Multi-hop chain analysis for all requested depths (single pass)
+        self.analyze_multi_hop_chains(
+            use_labels,
+            output_prefix,
+            n_hops=hop_lengths,
+            output_format=chain_output_format,
+            workers=workers,
+        )
         
         # Step 13: Save results and visualize
         test_df.to_csv(f'{output_prefix}_pivot_predictions.csv', index=False)
@@ -1401,49 +1507,17 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         results = []
         
         print(f"  Processing {len(events)} events in memory...")
-        with tqdm(total=len(events), desc=f"  Processing {set_name} events", 
-                 unit="subnet") as pbar:
-            
-            for event in events:
-                subnet = event['victim_subnet']
-                recon_time = event['recon_time']
-                
-                # Get features from pre-fetched data
-                features = subnet_features.get(subnet)
-                if not features or not features['embeddings']:
-                    pbar.update(1)
-                    continue
-                
-                # Get pivot info from pre-fetched data
-                pivot_key = (subnet, recon_time)
-                pivot_info = pivot_behaviors.get(pivot_key, {
-                    'became_pivot': False,
-                    'attack_count': 0,
-                    'pivot_ips': []
-                })
-                
-                # Average embeddings
-                avg_embedding = np.mean(features['embeddings'], axis=0)
-                
-                results.append({
-                    'subnet': subnet,
-                    'recon_time': recon_time,
-                    'embedding': avg_embedding,
-                    'became_pivot': pivot_info['became_pivot'],
-                    'attack_count': pivot_info['attack_count'],
-                    'pivot_ips': pivot_info['pivot_ips'],
-                    'subnet_size': features['subnet_size'],
-                    'avg_pagerank': features['avg_pagerank'],
-                    'max_pagerank': features['max_pagerank'],
-                    'avg_betweenness': features['avg_betweenness'],
-                    'max_betweenness': features['max_betweenness'],
-                    'avg_clustering': features['avg_clustering'],
-                    'avg_velocity': features['avg_velocity'],
-                    'max_velocity': features['max_velocity'],
-                    'avg_burst': features['avg_burst']
-                })
-                
-                pbar.update(1)
+        
+        # Parallel processing
+        num_workers = min(multiprocessing.cpu_count(), 16)  # Cap at 16 to avoid overhead
+        chunk_size = max(1, len(events) // (num_workers * 4))
+        chunks = [events[i:i + chunk_size] for i in range(0, len(events), chunk_size)]
+        
+        print(f"  Using {num_workers} workers to process {len(chunks)} chunks...")
+        
+        with multiprocessing.Pool(processes=num_workers, initializer=_init_worker, initargs=(subnet_features, pivot_behaviors)) as pool:
+            for chunk_results in tqdm(pool.imap_unordered(_process_event_chunk, chunks), total=len(chunks), desc=f"  Processing {set_name} events"):
+                results.extend(chunk_results)
         
         return results
     
@@ -1584,17 +1658,33 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                     'technique': record.get('technique')
                 })
 
+            # Ensure sorted for bisect
+            for subnet in subnet_lateral_moves:
+                subnet_lateral_moves[subnet].sort(key=lambda x: x['timestamp'])
+            
+            # Pre-compute timestamps for bisect
+            subnet_timestamps = {
+                subnet: [m['timestamp'] for m in moves]
+                for subnet, moves in subnet_lateral_moves.items()
+            }
+
             pivot_map = {}
             min_connections = 2
 
-            for event in events:
+            for event in tqdm(events, desc="    Mapping pivots", unit="event"):
                 subnet = event['victim_subnet']
                 recon_time = event['recon_time']
-
-                lateral_moves = [
-                    move for move in subnet_lateral_moves.get(subnet, [])
-                    if recon_time < move['timestamp'] <= recon_time + det_window_sec
-                ]
+                
+                moves = subnet_lateral_moves.get(subnet, [])
+                timestamps = subnet_timestamps.get(subnet, [])
+                
+                if not moves:
+                    lateral_moves = []
+                else:
+                    # Use bisect to find range
+                    start_idx = bisect.bisect_right(timestamps, recon_time)
+                    end_idx = bisect.bisect_right(timestamps, recon_time + det_window_sec)
+                    lateral_moves = moves[start_idx:end_idx]
 
                 attack_count = len(lateral_moves)
                 pivot_ips_set = {move['pivot_ip'] for move in lateral_moves if move['pivot_ip']}
@@ -1802,20 +1892,133 @@ class SubnetPivotAnalyzer(Neo4jConnection):
             diff = (fastrp_f1 - best_method['F1-Score']) * 100
             print(f"  ⚠ FastRP is {abs(diff):.2f}pp {'behind' if diff < 0 else 'ahead of'} best baseline")
     
-    def analyze_multi_hop_chains(self, use_labels: bool, output_prefix: str, n_hops: int = 3, use_cache: bool = True):
+    def _aggregate_manifest_batches(
+        self,
+        manifest_path: str,
+        output_file: str,
+        n_hops: int,
+        use_labels: bool
+    ):
+        if pl is None:
+            print("  ⚠ Cannot aggregate manifest without polars; install with `pip install polars`." )
+            return
+
+        manifest = Path(manifest_path)
+        if not manifest.exists():
+            print(f"  ⚠ Manifest not found at {manifest_path}; skipping aggregation.")
+            return
+
+        with open(manifest, 'r') as mf:
+            batch_files = [line.strip() for line in mf if line.strip()]
+
+        if not batch_files:
+            print("  ⚠ Manifest is empty; no batches to aggregate.")
+            return
+
+        first_suffix = Path(batch_files[0]).suffix.lower()
+        json_suffixes = {'.jsonl', '.ndjson', '.json'}
+
+        if first_suffix == '.parquet':
+            sample_columns = list(pl.scan_parquet(batch_files[0]).schema.keys())
+
+            def scan_all():
+                return pl.scan_parquet(batch_files)
+
+        elif first_suffix in json_suffixes:
+            sample_columns = list(pl.scan_ndjson(batch_files[0]).schema.keys())
+
+            def scan_all():
+                return pl.concat([pl.scan_ndjson(f) for f in batch_files])
+
+        else:
+            print(f"  ⚠ Unsupported batch format {first_suffix}; expected parquet or jsonl")
+            return
+
+        timing_exprs = []
+        timing_col_names: List[str] = []
+        for hop_num in range(3, n_hops + 2):
+            curr = f'hop{hop_num}_time'
+            prev = f'hop{hop_num - 1}_time'
+            if curr in sample_columns and prev in sample_columns:
+                alias_name = f'hours_to_hop{hop_num}'
+                timing_col_names.append(alias_name)
+                timing_exprs.append(((pl.col(curr) - pl.col(prev)) / 3600.0).alias(alias_name))
+
+        def build_lazy_frame():
+            frame = scan_all()
+            if timing_exprs:
+                frame = frame.with_columns(timing_exprs)
+            return frame
+
+        print(f"  Step 4: Combining {len(batch_files)} batches into {output_file} (streaming)...")
+        output_path = Path(output_file)
+        if output_path.exists():
+            output_path.unlink()
+        build_lazy_frame().sink_csv(output_file)
+        print("    ✓ Streaming CSV written")
+
+        if timing_col_names:
+            stats_exprs = []
+            for col in timing_col_names:
+                stats_exprs.extend([
+                    pl.col(col).mean().alias(f'mean_{col}'),
+                    pl.col(col).median().alias(f'median_{col}')
+                ])
+            stats_df = build_lazy_frame().select(stats_exprs).collect(streaming=True)
+            stats_row = stats_df.to_dicts()[0]
+            print("\n  Chain Timing Statistics:")
+            for col in timing_col_names:
+                mean_val = stats_row.get(f'mean_{col}')
+                median_val = stats_row.get(f'median_{col}')
+                if mean_val is not None:
+                    hop_label = col.replace('hours_to_', '').replace('_', ' ')
+                    print(f"    Mean {hop_label}: {mean_val:.2f} hours")
+                if median_val is not None:
+                    hop_label = col.replace('hours_to_', '').replace('_', ' ')
+                    print(f"    Median {hop_label}: {median_val:.2f} hours")
+
+        if use_labels:
+            tactic_cols = [c for c in sample_columns if c.startswith('tactic')]
+            if tactic_cols:
+                tactic_df = (
+                    build_lazy_frame()
+                    .group_by(tactic_cols)
+                    .agg(pl.len().alias('count'))
+                    .sort('count', descending=True)
+                    .limit(5)
+                    .collect(streaming=True)
+                )
+                if tactic_df.height > 0:
+                    print("\n  Most Common Tactic Sequences:")
+                    for row in tactic_df.iter_rows(named=True):
+                        tactic_seq = ' → '.join([str(row.get(col) or 'None') for col in tactic_cols])
+                        print(f"    {tactic_seq}: {int(row['count']):,} chains")
+
+        print(f"\n  ✓ Analysis complete. Results saved to {output_file}")
+
+    def analyze_multi_hop_chains(
+        self,
+        use_labels: bool,
+        output_prefix: str,
+        n_hops: Union[int, Iterable[int]] = 3,
+        use_cache: bool = True,
+        workers: int = 1,
+        output_format: str = 'parquet',
+    ):
         """
         Analyze multi-hop attack chains using incremental node-by-node traversal.
         
         Args:
             use_labels: Whether to use attack labels (filter to attacks only)
             output_prefix: Prefix for output files
-            n_hops: Number of hops to analyze (default: 3, producing 4-node chains A→B→C→D)
-            use_cache: Whether to use cached results for lower hop counts
-        
-        Exports edges from Neo4j, then uses recursive exploration to avoid join explosion.
-        Results are cached so that higher hop counts can reuse lower hop computations.
+            n_hops: Number of hops to analyze (int or list of ints)
+            use_cache: Whether to use cached results
+            workers: Number of parallel workers (unused in single-process mode)
+            output_format: 'parquet' (default) or 'jsonl' batches
         """
-        print(f"\n--- Multi-Hop Attack Chain Analysis ({n_hops}-hop chains, Incremental Traversal) ---")
+        target_hops = _normalize_hop_lengths(n_hops)
+        hop_desc = ', '.join(str(h) for h in target_hops)
+        print(f"\n--- Multi-Hop Attack Chain Analysis (Depths: {hop_desc}, Incremental Traversal) ---")
         
         if pl is None:
             print("  ⚠ Polars not installed. Run: pip install polars")
@@ -1823,31 +2026,50 @@ class SubnetPivotAnalyzer(Neo4jConnection):
         
         import tempfile
         
-        output_file = f'{output_prefix}_{n_hops}hop_chains.csv'
+        # Check if ALL output files already exist
+        all_exist = True
+        for h in target_hops:
+            out_f = f'{output_prefix}_{h}hop_chains.csv'
+            if not (os.path.exists(out_f) and os.path.getsize(out_f) > 0):
+                all_exist = False
+                break
         
+        if all_exist:
+            print(f"  ✓ All output files for hops {target_hops} already exist. Skipping generation.")
+            return
+
         # Create cache directory
         cache_dir = os.path.join(os.path.dirname(output_prefix) or '.', '.chain_cache')
         os.makedirs(cache_dir, exist_ok=True)
         
         # Generate cache key based on parameters
-        cache_params = f"labels={use_labels}_nhops={n_hops}"
+        # We use a tuple of hops for the key
+        cache_params = f"labels={use_labels}_nhops={tuple(target_hops)}"
         cache_key = hashlib.md5(cache_params.encode()).hexdigest()
-        cache_file = os.path.join(cache_dir, f'chains_{cache_key}.pkl')
+        cache_file = os.path.join(cache_dir, f'chains_multi_{cache_key}.pkl')
         edge_cache_file = os.path.join(cache_dir, f'edges_{hashlib.md5(f"labels={use_labels}".encode()).hexdigest()}.pkl')
+        
+        manifest_map: Dict[int, str] = {}
         
         # Check if we have cached results
         if use_cache and os.path.exists(cache_file):
-            print(f"  ✓ Loading cached {n_hops}-hop chains from {cache_file}")
+            print(f"  ✓ Loading cached multi-hop metadata from {cache_file}")
             with open(cache_file, 'rb') as f:
-                all_chains = pickle.load(f)
-            print(f"  ✓ Loaded {len(all_chains):,} chains from cache")
-        else:
-            # Step 1: Load or export edges
+                cache_payload = pickle.load(f)
+            
+            if isinstance(cache_payload, dict) and 'manifest_map' in cache_payload:
+                manifest_map = cache_payload['manifest_map']
+                print(f"  ✓ Located cached manifests for {len(manifest_map)} hop depths")
+            else:
+                print("  ⚠ Invalid cache format, ignoring.")
+
+        if not manifest_map:
+            # Step 1: Load or export edges (same as before)
             if use_cache and os.path.exists(edge_cache_file):
                 print(f"  Step 1: Loading cached edge data from {edge_cache_file}...")
                 with open(edge_cache_file, 'rb') as f:
-                    edge_index = pickle.load(f)
-                print(f"  ✓ Loaded edge index with {len(edge_index):,} source nodes from cache")
+                    adj_list = pickle.load(f)
+                print(f"  ✓ Loaded adjacency list with {len(adj_list):,} source nodes from cache")
             else:
                 print("  Step 1: Exporting CONNECTS edges from Neo4j...")
                 temp_edges_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
@@ -1855,7 +2077,6 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 temp_edges_file.close()
                 
                 with self.driver.session(database=self.database) as session:
-                    # Export query with all necessary attributes
                     export_query = """
                     MATCH (a:IP)-[r:CONNECTS]->(b:IP)
                     RETURN 
@@ -1868,10 +2089,8 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                         CASE WHEN r.is_attack = 1 THEN r.tactic ELSE null END as tactic
                     ORDER BY r.timestamp
                     """
-                    
                     result = session.run(export_query)
                     
-                    # Write to temp CSV with progress bar
                     import csv
                     with open(temp_edges_path, 'w', newline='') as f:
                         writer = None
@@ -1884,13 +2103,11 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                                 writer.writerow(dict(record))
                                 count += 1
                                 pbar.update(1)
-                    
                     print(f"  ✓ Exported {count:,} edges to temporary file")
                 
-                # Step 2: Load edges and build adjacency structure
                 print("  Step 2: Loading edges and building adjacency structure...")
                 edges_df = pd.read_csv(temp_edges_path)
-                os.unlink(temp_edges_path)  # Clean up immediately
+                os.unlink(temp_edges_path)
                 
                 if use_labels:
                     edges_df = edges_df[edges_df['is_attack'] == 1].copy()
@@ -1898,7 +2115,6 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                 else:
                     print(f"  ✓ Loaded {len(edges_df):,} edges (all traffic)")
                 
-                # Build adjacency list: src_ip -> list of (dst_ip, timestamp, dst_subnet, tactic)
                 print("    Building adjacency list...")
                 adj_list = defaultdict(list)
                 for _, row in edges_df.iterrows():
@@ -1910,179 +2126,147 @@ class SubnetPivotAnalyzer(Neo4jConnection):
                         'tactic': row.get('tactic') if use_labels else None
                     })
                 
-                # Sort each adjacency list by timestamp for faster temporal filtering
                 for src_ip in adj_list:
                     adj_list[src_ip].sort(key=lambda x: x['timestamp'])
                 
                 print(f"    ✓ Built adjacency list with {len(adj_list):,} nodes")
                 
-                # Cache the adjacency structure
                 if use_cache:
                     print(f"    Caching adjacency list to {edge_cache_file}...")
                     with open(edge_cache_file, 'wb') as f:
                         pickle.dump(dict(adj_list), f)
                     print("    ✓ Adjacency list cached")
             
-            # Step 3: Build chains incrementally using batch expansion
-            print(f"  Step 3: Building {n_hops}-hop chains using batch expansion...")
-            print(f"    Using adjacency lookups to avoid expensive joins")
+            # Step 3: Build chains incrementally
+            print(f"  Step 3: Building chains for depths {target_hops}...")
+            BATCH_SIZE = 100000
             
-            BATCH_SIZE = 10000  # Process chains in batches to manage memory
+            from CART.incremental_chain_builder import build_chains_incremental as _builder, extend_chains_from_disk
+
+            # Identify which hops need to be built from scratch vs extended
+            # We need to find a contiguous sequence of missing hops.
+            # If we have hop N, we can build N+1.
             
-            # Initialize with 1-hop "chains" (single edges)
-            # Format: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
-            current_chains = []
-            for src_ip, edges in adj_list.items():
-                src_subnet = edges[0]['src_subnet'] if edges else None
-                for edge in edges:
-                    current_chains.append([
-                        src_ip, src_subnet,
-                        edge['dst_ip'], edge['dst_subnet'], edge['timestamp'],
-                        edge['tactic']
-                    ])
+            # Check what we have in the manifest_map (loaded from cache)
+            # If we have hop 100, and we need 101, we can extend.
             
-            print(f"    Starting with {len(current_chains):,} 1-hop chains (base edges)")
+            # Sort target hops
+            sorted_targets = sorted(target_hops)
             
-            # Extend chains hop by hop
-            for hop_num in range(2, n_hops + 1):
-                print(f"    Extending to {hop_num}-hop chains...")
-                next_chains = []
+            # Group targets into "build from scratch" (if no predecessor) and "extend"
+            # Actually, the _builder function is efficient for a range.
+            # But if we have a gap, e.g. we have 100, need 101.
+            
+            # Let's check if we can extend from ANY existing hop.
+            # Find the largest existing hop < min(target_hops)
+            
+            # But wait, if we need [101], and we have [100] in cache.
+            # We should just extend 100 -> 101.
+            
+            # If we need [2..100], and we have nothing. Run _builder for [2..100].
+            
+            # If we need [50..100], and we have [49]. Extend 49->50, then 50->51...
+            
+            # Strategy:
+            # 1. Identify the "base" hop.
+            #    If we have cached manifests, find the max cached hop `max_cached`.
+            #    If `max_cached` >= min(target_hops) - 1, we can potentially start extending from `max_cached`.
+            #    Actually, we want to start extending from `min(target_hops) - 1` if available.
+            
+            # Let's simplify:
+            # If we have to build from scratch (no relevant cache), use _builder for ALL targets.
+            # If we have a relevant predecessor, use extend_chains_from_disk iteratively.
+            
+            # Check for predecessor of the first target
+            first_target = sorted_targets[0]
+            predecessor_hop = first_target - 1
+            
+            # Check if predecessor manifest exists in our map (loaded from cache)
+            predecessor_manifest = manifest_map.get(predecessor_hop)
+            
+            if predecessor_manifest and os.path.exists(predecessor_manifest):
+                print(f"  ✓ Found existing {predecessor_hop}-hop chains. Extending iteratively to {sorted_targets[-1]}...")
                 
-                # Process in batches to show progress
-                num_batches = (len(current_chains) + BATCH_SIZE - 1) // BATCH_SIZE
+                current_manifest = predecessor_manifest
+                current_hop = predecessor_hop
                 
-                with tqdm(total=len(current_chains), desc=f"      Processing chains", unit=" chains") as pbar:
-                    for batch_idx in range(num_batches):
-                        start_idx = batch_idx * BATCH_SIZE
-                        end_idx = min(start_idx + BATCH_SIZE, len(current_chains))
-                        batch = current_chains[start_idx:end_idx]
+                # Iteratively extend
+                for target in sorted_targets:
+                    # If we skipped some hops (e.g. have 50, need 55), we must fill the gap
+                    # But `sorted_targets` is what the user requested.
+                    # If user requested [55], and we have 50. We need to generate 51, 52, 53, 54, 55.
+                    # So we need to loop from current_hop + 1 to target.
+                    
+                    while current_hop < target:
+                        next_hop = current_hop + 1
+                        print(f"    Extending {current_hop} -> {next_hop}...")
                         
-                        for chain in batch:
-                            # Get the last node in the chain
-                            # Chain structure: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
-                            last_hop_idx = 2 + (hop_num - 1) * 3  # Position of last hop's IP
-                            last_ip = chain[last_hop_idx]
-                            last_time = chain[last_hop_idx + 2]
-                            
-                            # Find all valid next edges
-                            if last_ip in adj_list:
-                                for edge in adj_list[last_ip]:
-                                    # Temporal constraint
-                                    if edge['timestamp'] <= last_time:
-                                        continue
-                                    
-                                    # Cycle prevention: check if dst_ip already in chain
-                                    # IPs are at positions: 0, 2, 5, 8, ... = 0, then 2+3*k
-                                    dst_ip = edge['dst_ip']
-                                    is_cycle = False
-                                    for k in range(hop_num):
-                                        ip_pos = 0 if k == 0 else 2 + k * 3
-                                        if chain[ip_pos] == dst_ip:
-                                            is_cycle = True
-                                            break
-                                    
-                                    if not is_cycle:
-                                        # Extend chain
-                                        new_chain = chain + [
-                                            dst_ip,
-                                            edge['dst_subnet'],
-                                            edge['timestamp'],
-                                            edge['tactic']
-                                        ]
-                                        next_chains.append(new_chain)
+                        # Define output dir
+                        temp_dir = Path(os.path.dirname(output_prefix) or '.') / 'chain_temp'
                         
-                        pbar.update(len(batch))
-                
-                current_chains = next_chains
-                print(f"      ✓ Found {len(current_chains):,} valid {hop_num}-hop chains")
-                
-                # Early stopping if no chains remain
-                if len(current_chains) == 0:
-                    print(f"      ⚠ No chains found at depth {hop_num}, stopping")
-                    return
-                
-                # Safety check: if chains are exploding, warn user
-                if len(current_chains) > 10_000_000:
-                    print(f"      ⚠ WARNING: {len(current_chains):,} chains detected!")
-                    print(f"      This may consume significant memory. Consider filtering more aggressively.")
-            
-            print(f"  ✓ Built {len(current_chains):,} valid {n_hops}-hop chains")
-            
-            # Convert flat list format to structured data
-            print("    Converting chains to structured format...")
-            chains_data = []
-            for chain in tqdm(current_chains, desc="      Structuring", unit=" chains"):
-                # Parse chain: [hop1_ip, hop1_subnet, hop2_ip, hop2_subnet, hop2_time, tactic1, ...]
-                record = {}
-                for hop_idx in range(n_hops + 1):
-                    if hop_idx == 0:
-                        record['hop1_ip'] = chain[0]
-                        record['hop1_subnet'] = chain[1]
-                    else:
-                        pos = 2 + (hop_idx - 1) * 3
-                        record[f'hop{hop_idx + 1}_ip'] = chain[pos]
-                        record[f'hop{hop_idx + 1}_subnet'] = chain[pos + 1]
-                        record[f'hop{hop_idx + 1}_time'] = chain[pos + 2]
-                        if use_labels:
-                            record[f'tactic{hop_idx}'] = chain[pos + 3] if len(chain) > pos + 3 else None
-                chains_data.append(record)
-            
-            # Convert to Polars DataFrame
-            chains = pl.DataFrame(chains_data)
-            
-            # Cache the results
-            if use_cache:
-                print(f"    Caching chains to {cache_file}...")
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(chains, f)
-                print("    ✓ Chains cached for future use")
-        
-        # Step 4: Compute timing columns (hours between hops)
-        print("  Step 4: Computing timing statistics...")
-        
-        for hop_num in range(2, n_hops + 2):
-            if f'hop{hop_num}_time' in chains.columns:
-                prev_time_col = f'hop{hop_num - 1}_time' if hop_num > 2 else 'hop2_time'
-                if prev_time_col in chains.columns:
-                    chains = chains.with_columns([
-                        ((pl.col(f'hop{hop_num}_time') - pl.col(prev_time_col)) / 3600.0)
-                        .alias(f'hours_to_hop{hop_num}')
-                    ])
-        
-        print(f"    ✓ Added timing columns")
-        
-        # Step 5: Save to CSV
-        print(f"  Step 5: Saving chains to {output_file}...")
-        chains.write_csv(output_file)
-        
-        # Step 6: Compute summary statistics
-        print(f"\n  Chain Timing Statistics:")
-        for hop in range(2, n_hops + 2):  # n_hops produces n+1 nodes
-            col_name = f'hours_to_hop{hop}'
-            if col_name in chains.columns:
-                mean_time = chains[col_name].mean()
-                median_time = chains[col_name].median()
-                print(f"    Mean time to hop {hop}: {mean_time:.2f} hours")
-                print(f"    Median time to hop {hop}: {median_time:.2f} hours")
-        
-        # Step 7: Tactic sequence analysis (label-aware only)
-        if use_labels:
-            print(f"\n  Most Common Tactic Sequences:")
-            # Build dynamic tactic columns list
-            tactic_cols = [f'tactic{i}' for i in range(1, n_hops + 1) if f'tactic{i}' in chains.columns]
-            
-            if tactic_cols:
-                tactic_counts = (
-                    chains.group_by(tactic_cols)
-                    .agg(pl.len().alias('count'))
-                    .sort('count', descending=True)
-                    .head(5)
+                        count, new_manifest = extend_chains_from_disk(
+                            input_manifest=current_manifest,
+                            output_dir=temp_dir,
+                            edge_index=adj_list,
+                            current_hop=current_hop,
+                            mode='label_aware' if use_labels else 'label_agnostic',
+                            batch_size=BATCH_SIZE,
+                            output_format=output_format
+                        )
+                        
+                        # Update state
+                        current_manifest = new_manifest
+                        current_hop = next_hop
+                        
+                        # Save to map if it's one of our targets (or if we want to cache intermediates)
+                        manifest_map[current_hop] = current_manifest
+                        
+                        # Update cache incrementally
+                        if use_cache:
+                            cache_payload = {'manifest_map': manifest_map}
+                            with open(cache_file, 'wb') as f:
+                                pickle.dump(cache_payload, f)
+                                
+            else:
+                # No predecessor, build from scratch using the efficient DFS builder
+                print(f"  No predecessor found for {first_target}-hop chains. Running full DFS build...")
+                _, total_counts, new_manifest_map = _builder(
+                    csv_path=None,
+                    num_hops=target_hops,  # Pass list!
+                    mode='label_aware' if use_labels else 'label_agnostic',
+                    batch_size=BATCH_SIZE,
+                    combine_batches=False,
+                    edge_index=adj_list,
+                    start_nodes=None,
+                    output_format=output_format,
+                    workers=workers,
                 )
-                for row in tactic_counts.iter_rows(named=True):
-                    tactic_seq = ' → '.join([row.get(col) or 'None' for col in tactic_cols])
-                    print(f"    {tactic_seq}: {row['count']:,} chains")
+                
+                if new_manifest_map:
+                    manifest_map.update(new_manifest_map)
+                    if use_cache:
+                        cache_payload = {'manifest_map': manifest_map}
+                        with open(cache_file, 'wb') as f:
+                            pickle.dump(cache_payload, f)
+                else:
+                    print("  ⚠ No chain data generated.")
+                    return
+
+        # Step 4: Process each hop depth
+        print("  Step 4: Processing and saving results for each depth...")
         
-        print(f"\n  ✓ Analysis complete. Results saved to {output_file}")
+        for depth in target_hops:
+            if depth not in manifest_map:
+                print(f"    ⚠ No data for {depth}-hop chains")
+                continue
+                
+            manifest_path = manifest_map[depth]
+            output_file = f'{output_prefix}_{depth}hop_chains.csv'
+            
+            print(f"    Processing {depth}-hop chains from {manifest_path}...")
+            self._aggregate_manifest_batches(str(manifest_path), output_file, depth, use_labels)
+            
+        print(f"\n  ✓ Multi-hop analysis complete. Results saved to {output_prefix}_*hop_chains.csv")
         print(f"  💾 Cached data available at {cache_dir}")
     
     def compare_analysis_modes(self):

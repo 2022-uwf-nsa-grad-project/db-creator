@@ -7,10 +7,22 @@ A comprehensive toolkit for building and analyzing network graphs for threat int
 # This allows users to write `from CART import ThesisAnalyzer` instead of
 # `from CART.analyzers import ThesisAnalyzer`.
 
+import sys
+
 from .base import Neo4jConnection
 from .analyzers import TemporalWindowAnalyzer, SubnetPivotAnalyzer
 from .reporting import ReportGenerator
 from .controller import Controller
+
+# Re-export frequently imported modules for backward compatibility with
+# earlier scripts that lived at the repository root.
+from . import chain_builder as _chain_builder
+from . import incremental_chain_builder as _incremental_chain_builder
+from .cli import optimize_windows as _optimize_windows
+
+sys.modules.setdefault('chain_builder', _chain_builder)
+sys.modules.setdefault('incremental_chain_builder', _incremental_chain_builder)
+sys.modules.setdefault('optimize_windows', _optimize_windows)
 
 # Backwards-compatible alias: some notebooks and examples used AnalysisController
 # previously. Keep the alias to avoid breaking existing code.
