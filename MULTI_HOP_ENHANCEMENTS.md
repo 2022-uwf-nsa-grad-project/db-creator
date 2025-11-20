@@ -6,10 +6,11 @@ Enhanced the `analyze_multi_hop_chains` method in `CART/analyzers.py` to support
 
 ## Key Features Added
 
-### 1. **Configurable N-Hop Analysis** (Default: 3 hops)
-- Added `n_hops` parameter to control chain depth
-- Dynamically generates hop columns (hop1, hop2, ..., hopN)
-- Produces (n_hops + 1)-node chains (e.g., 3 hops = 4 nodes: A→B→C→D)
+### 1. **Configurable (and Multi) N-Hop Analysis**
+- `n_hops` now accepts either a single integer or any iterable of depths.
+- Pass `[2, 3, 4, 5]` to emit four separate chain manifests in a single analysis pass.
+- Dynamically generates hop columns (hop1, hop2, ..., hopN) for every requested depth.
+- Produces (n_hops + 1)-node chains (e.g., 3 hops = 4 nodes: A→B→C→D).
 
 ### 2. **Intelligent Caching System**
 - **Edge Index Caching**: Neo4j edge exports are cached to avoid repeated database queries
@@ -73,10 +74,15 @@ analyzer.analyze_multi_hop_chains(
 
 ## Output Files
 
+### Streaming Batch Formats
+- Batches can now be materialized as **Parquet** (default) or **newline-delimited JSON (JSONL)** via the new `chain_output_format` parameter surfaced in `run_full_analysis` (and exposed in the notebook as `CHAIN_OUTPUT_FORMAT`).
+- Parquet remains ideal for analytics-ready workflows; JSONL keeps files human-readable and avoids any implicit in-memory concatenation in the notebook kernel.
+
 ### Generated Files
-- `{output_prefix}_{n_hops}hop_chains.csv` - Chain data with timing statistics
+- `{output_prefix}_{n_hops}hop_chains.csv` - Chain data with timing statistics (now streamed directly from disk-backed parquet/JSONL batches, so very large runs no longer exhaust memory).
+- `{output_prefix}_{n_hops}hop_summary.json` - Lightweight summary (counts, depth histogram, tactic frequencies) created during streaming aggregation.
 - `.chain_cache/edges_{hash}.pkl` - Cached edge index
-- `.chain_cache/chains_{hash}.pkl` - Cached chain results
+- `.chain_cache/chains_{hash}.pkl` - Cached chain results or manifest pointers when full materialization would be too large
 
 ### CSV Columns (Dynamic based on n_hops)
 For 3-hop analysis:
