@@ -1,0 +1,560 @@
+{
+  "basic_stats": {
+    "total_ips": 357,
+    "total_connections": 1898613,
+    "total_subnets": 21
+  },
+  "attack_distribution": [
+    {
+      "is_attack": 1,
+      "count": 1898613,
+      "sample_tactics": [
+        "Reconnaissance",
+        "none",
+        "Credential Access",
+        "Defense Evasion",
+        "Initial Access",
+        "Exfiltration"
+      ],
+      "sample_techniques": [
+        "T1595",
+        "none",
+        "T1110",
+        "T1078",
+        "T1190",
+        "T1048"
+      ]
+    }
+  ],
+  "reconnaissance_patterns": [
+    {
+      "attacker_subnet": "143.88.4.0/24",
+      "victim_subnet": "143.88.5.0/24",
+      "recon_count": 15066,
+      "first_recon": 1709092967.651583,
+      "last_recon": 1711580489.263803,
+      "sample_attackers": [
+        "143.88.4.11"
+      ],
+      "sample_victims": [
+        "143.88.5.4",
+        "143.88.5.5",
+        "143.88.5.16"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.10.0/24",
+      "victim_subnet": "143.88.11.0/24",
+      "recon_count": 14661,
+      "first_recon": 1709093050.185093,
+      "last_recon": 1711580642.218524,
+      "sample_attackers": [
+        "143.88.10.12"
+      ],
+      "sample_victims": [
+        "143.88.11.15",
+        "143.88.11.12",
+        "143.88.11.13"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.12.0/24",
+      "victim_subnet": "143.88.13.0/24",
+      "recon_count": 3259,
+      "first_recon": 1709094307.451242,
+      "last_recon": 1711583590.118523,
+      "sample_attackers": [
+        "143.88.12.12"
+      ],
+      "sample_victims": [
+        "143.88.13.11",
+        "143.88.13.14",
+        "143.88.13.13"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.1.0/24",
+      "victim_subnet": "143.88.2.0/24",
+      "recon_count": 2903,
+      "first_recon": 1709095906.493049,
+      "last_recon": 1711583221.329492,
+      "sample_attackers": [
+        "143.88.1.18"
+      ],
+      "sample_victims": [
+        "143.88.2.21",
+        "143.88.2.19",
+        "143.88.2.18"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.15.0/24",
+      "victim_subnet": "143.88.1.0/24",
+      "recon_count": 2849,
+      "first_recon": 1709092837.805641,
+      "last_recon": 1711582114.420792,
+      "sample_attackers": [
+        "143.88.15.10"
+      ],
+      "sample_victims": [
+        "143.88.1.10",
+        "143.88.1.18",
+        "143.88.1.1"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.8.0/24",
+      "victim_subnet": "143.88.9.0/24",
+      "recon_count": 2446,
+      "first_recon": 1709095373.37969,
+      "last_recon": 1711580737.531663,
+      "sample_attackers": [
+        "143.88.8.12"
+      ],
+      "sample_victims": [
+        "143.88.9.13",
+        "143.88.9.1",
+        "143.88.9.14"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.5.0/24",
+      "victim_subnet": "143.88.6.0/24",
+      "recon_count": 2443,
+      "first_recon": 1709093624.620896,
+      "last_recon": 1711581689.808405,
+      "sample_attackers": [
+        "143.88.5.14"
+      ],
+      "sample_victims": [
+        "143.88.6.10",
+        "143.88.6.1",
+        "143.88.6.11"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.6.0/24",
+      "victim_subnet": "143.88.7.0/24",
+      "recon_count": 2443,
+      "first_recon": 1709095049.675364,
+      "last_recon": 1711582098.895453,
+      "sample_attackers": [
+        "143.88.6.11"
+      ],
+      "sample_victims": [
+        "143.88.7.10",
+        "143.88.7.11",
+        "143.88.7.1"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.7.0/24",
+      "victim_subnet": "143.88.8.0/24",
+      "recon_count": 2442,
+      "first_recon": 1709094627.872889,
+      "last_recon": 1711580481.891005,
+      "sample_attackers": [
+        "143.88.7.11"
+      ],
+      "sample_victims": [
+        "143.88.8.11",
+        "143.88.8.10",
+        "143.88.8.1"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.2.0/24",
+      "victim_subnet": "143.88.3.0/24",
+      "recon_count": 2064,
+      "first_recon": 1709095770.349288,
+      "last_recon": 1711581540.797448,
+      "sample_attackers": [
+        "143.88.2.17"
+      ],
+      "sample_victims": [
+        "143.88.3.12",
+        "143.88.3.10",
+        "143.88.3.1"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.14.0/24",
+      "victim_subnet": "143.88.15.0/24",
+      "recon_count": 2058,
+      "first_recon": 1709093818.715095,
+      "last_recon": 1711582947.000638,
+      "sample_attackers": [
+        "143.88.14.11"
+      ],
+      "sample_victims": [
+        "143.88.15.11",
+        "143.88.15.10",
+        "143.88.15.14"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.11.0/24",
+      "victim_subnet": "143.88.12.0/24",
+      "recon_count": 2035,
+      "first_recon": 1709094387.161054,
+      "last_recon": 1711580981.121912,
+      "sample_attackers": [
+        "143.88.11.10"
+      ],
+      "sample_victims": [
+        "143.88.12.12",
+        "143.88.12.11",
+        "143.88.12.1"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.9.0/24",
+      "victim_subnet": "143.88.10.0/24",
+      "recon_count": 1795,
+      "first_recon": 1709115186.078404,
+      "last_recon": 1711582925.983859,
+      "sample_attackers": [
+        "143.88.9.12"
+      ],
+      "sample_victims": [
+        "143.88.10.13",
+        "143.88.10.14",
+        "143.88.10.12"
+      ]
+    },
+    {
+      "attacker_subnet": "143.88.13.0/24",
+      "victim_subnet": "143.88.14.0/24",
+      "recon_count": 1631,
+      "first_recon": 1709093390.821218,
+      "last_recon": 1711580790.872169,
+      "sample_attackers": [
+        "143.88.13.12"
+      ],
+      "sample_victims": [
+        "143.88.14.11",
+        "143.88.14.10",
+        "143.88.14.14"
+      ]
+    }
+  ],
+  "lateral_movement_patterns": [],
+  "attack_chains": [
+    {
+      "victim_subnet": "143.88.8.0/24",
+      "attacker_subnet": "143.88.7.0/24",
+      "pivot_attacks": 9044,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.9.0/24"
+      ],
+      "first_recon": 1709094627.872889,
+      "first_pivot": 1709095733.45383,
+      "hours_to_pivot": 0.3071058169338438
+    },
+    {
+      "victim_subnet": "143.88.12.0/24",
+      "attacker_subnet": "143.88.11.0/24",
+      "pivot_attacks": 8929,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.13.0/24"
+      ],
+      "first_recon": 1709094387.161054,
+      "first_pivot": 1709096200.936341,
+      "hours_to_pivot": 0.5038264686531491
+    },
+    {
+      "victim_subnet": "143.88.5.0/24",
+      "attacker_subnet": "143.88.4.0/24",
+      "pivot_attacks": 8720,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.6.0/24"
+      ],
+      "first_recon": 1709092967.651583,
+      "first_pivot": 1709095308.352035,
+      "hours_to_pivot": 0.6501945700248083
+    },
+    {
+      "victim_subnet": "143.88.7.0/24",
+      "attacker_subnet": "143.88.6.0/24",
+      "pivot_attacks": 8505,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.8.0/24"
+      ],
+      "first_recon": 1709095049.675364,
+      "first_pivot": 1709095970.037939,
+      "hours_to_pivot": 0.2556562708483802
+    },
+    {
+      "victim_subnet": "143.88.14.0/24",
+      "attacker_subnet": "143.88.13.0/24",
+      "pivot_attacks": 8465,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.15.0/24"
+      ],
+      "first_recon": 1709093390.821218,
+      "first_pivot": 1709096107.415353,
+      "hours_to_pivot": 0.7546094819572237
+    },
+    {
+      "victim_subnet": "143.88.2.0/24",
+      "attacker_subnet": "143.88.1.0/24",
+      "pivot_attacks": 8362,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.3.0/24"
+      ],
+      "first_recon": 1709095906.493049,
+      "first_pivot": 1709096626.975945,
+      "hours_to_pivot": 0.20013413780265385
+    },
+    {
+      "victim_subnet": "143.88.3.0/24",
+      "attacker_subnet": "143.88.2.0/24",
+      "pivot_attacks": 8296,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.4.0/24"
+      ],
+      "first_recon": 1709095770.349288,
+      "first_pivot": 1709096077.57072,
+      "hours_to_pivot": 0.08533928665849898
+    },
+    {
+      "victim_subnet": "143.88.13.0/24",
+      "attacker_subnet": "143.88.12.0/24",
+      "pivot_attacks": 8144,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.14.0/24"
+      ],
+      "first_recon": 1709094307.451242,
+      "first_pivot": 1709099694.937278,
+      "hours_to_pivot": 1.496523898906178
+    },
+    {
+      "victim_subnet": "143.88.15.0/24",
+      "attacker_subnet": "143.88.14.0/24",
+      "pivot_attacks": 8089,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.1.0/24"
+      ],
+      "first_recon": 1709093818.715095,
+      "first_pivot": 1709096992.246685,
+      "hours_to_pivot": 0.8815365527735816
+    },
+    {
+      "victim_subnet": "143.88.6.0/24",
+      "attacker_subnet": "143.88.5.0/24",
+      "pivot_attacks": 6923,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.7.0/24"
+      ],
+      "first_recon": 1709093624.620896,
+      "first_pivot": 1709094510.262603,
+      "hours_to_pivot": 0.24601158526208666
+    },
+    {
+      "victim_subnet": "143.88.1.0/24",
+      "attacker_subnet": "143.88.15.0/24",
+      "pivot_attacks": 2294,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.2.0/24"
+      ],
+      "first_recon": 1709092837.805641,
+      "first_pivot": 1709093218.098984,
+      "hours_to_pivot": 0.10563703974088033
+    },
+    {
+      "victim_subnet": "143.88.9.0/24",
+      "attacker_subnet": "143.88.8.0/24",
+      "pivot_attacks": 817,
+      "pivot_tactics": [
+        "Credential Access"
+      ],
+      "target_subnets": [
+        "143.88.10.0/24"
+      ],
+      "first_recon": 1709095373.37969,
+      "first_pivot": 1709155167.526786,
+      "hours_to_pivot": 16.609485304488075
+    }
+  ],
+  "cross_subnet_patterns": [
+    {
+      "src_subnet": "143.88.3.0/24",
+      "dst_subnet": "143.88.4.0/24",
+      "attack_count": 125887,
+      "benign_count": 0,
+      "total_count": 125887
+    },
+    {
+      "src_subnet": "143.88.4.0/24",
+      "dst_subnet": "143.88.5.0/24",
+      "attack_count": 113566,
+      "benign_count": 0,
+      "total_count": 113566
+    },
+    {
+      "src_subnet": "143.88.7.0/24",
+      "dst_subnet": "143.88.8.0/24",
+      "attack_count": 107979,
+      "benign_count": 0,
+      "total_count": 107979
+    },
+    {
+      "src_subnet": "143.88.13.0/24",
+      "dst_subnet": "143.88.14.0/24",
+      "attack_count": 107906,
+      "benign_count": 0,
+      "total_count": 107906
+    },
+    {
+      "src_subnet": "143.88.14.0/24",
+      "dst_subnet": "143.88.15.0/24",
+      "attack_count": 93336,
+      "benign_count": 0,
+      "total_count": 93336
+    },
+    {
+      "src_subnet": "143.88.8.0/24",
+      "dst_subnet": "143.88.9.0/24",
+      "attack_count": 65982,
+      "benign_count": 0,
+      "total_count": 65982
+    },
+    {
+      "src_subnet": "143.88.2.0/24",
+      "dst_subnet": "143.88.3.0/24",
+      "attack_count": 62387,
+      "benign_count": 0,
+      "total_count": 62387
+    },
+    {
+      "src_subnet": "143.88.15.0/24",
+      "dst_subnet": "143.88.1.0/24",
+      "attack_count": 55989,
+      "benign_count": 0,
+      "total_count": 55989
+    },
+    {
+      "src_subnet": "143.88.5.0/24",
+      "dst_subnet": "143.88.6.0/24",
+      "attack_count": 53404,
+      "benign_count": 0,
+      "total_count": 53404
+    },
+    {
+      "src_subnet": "143.88.9.0/24",
+      "dst_subnet": "143.88.10.0/24",
+      "attack_count": 44412,
+      "benign_count": 0,
+      "total_count": 44412
+    },
+    {
+      "src_subnet": "143.88.6.0/24",
+      "dst_subnet": "143.88.7.0/24",
+      "attack_count": 34118,
+      "benign_count": 0,
+      "total_count": 34118
+    },
+    {
+      "src_subnet": "143.88.12.0/24",
+      "dst_subnet": "143.88.13.0/24",
+      "attack_count": 33008,
+      "benign_count": 0,
+      "total_count": 33008
+    },
+    {
+      "src_subnet": "143.88.1.0/24",
+      "dst_subnet": "143.88.2.0/24",
+      "attack_count": 28564,
+      "benign_count": 0,
+      "total_count": 28564
+    },
+    {
+      "src_subnet": "143.88.255.0/24",
+      "dst_subnet": "8.8.4.0/24",
+      "attack_count": 20279,
+      "benign_count": 0,
+      "total_count": 20279
+    },
+    {
+      "src_subnet": "143.88.255.0/24",
+      "dst_subnet": "8.8.8.0/24",
+      "attack_count": 19861,
+      "benign_count": 0,
+      "total_count": 19861
+    },
+    {
+      "src_subnet": "143.88.10.0/24",
+      "dst_subnet": "143.88.11.0/24",
+      "attack_count": 14885,
+      "benign_count": 0,
+      "total_count": 14885
+    },
+    {
+      "src_subnet": "143.88.2.0/24",
+      "dst_subnet": "143.88.255.0/24",
+      "attack_count": 14558,
+      "benign_count": 0,
+      "total_count": 14558
+    },
+    {
+      "src_subnet": "143.88.13.0/24",
+      "dst_subnet": "143.88.255.0/24",
+      "attack_count": 14551,
+      "benign_count": 0,
+      "total_count": 14551
+    },
+    {
+      "src_subnet": "143.88.4.0/24",
+      "dst_subnet": "143.88.255.0/24",
+      "attack_count": 14509,
+      "benign_count": 0,
+      "total_count": 14509
+    },
+    {
+      "src_subnet": "143.88.6.0/24",
+      "dst_subnet": "143.88.255.0/24",
+      "attack_count": 14500,
+      "benign_count": 0,
+      "total_count": 14500
+    }
+  ],
+  "temporal_distribution": [
+    {
+      "time_period": 1709092837.805641,
+      "attack_count": 1898613
+    }
+  ]
+}

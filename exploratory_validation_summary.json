@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-02-03T18:27:25.221679",
+  "claims_validated": {
+    "dataset_composition": {
+      "claim": "357 unique IPs, 21 subnets",
+      "actual_ips": 357,
+      "actual_subnets": 21,
+      "validated": true
+    },
+    "reconnaissance_windows": {
+      "claim": "28,692 reconnaissance windows",
+      "actual": 57384,
+      "validated": false
+    },
+    "pivot_rate": {
+      "claim": "94.85% pivot rate (27,214 of 28,692)",
+      "actual_count": 27214,
+      "actual_rate": 47.42436916213579,
+      "validated": false
+    },
+    "pivot_concentration": {
+      "claim": "13 unique pivot source IPs",
+      "actual": 13,
+      "validated": true
+    },
+    "dormant_subnet": {
+      "claim": "143.88.10 with 1,181 windows, zero pivots",
+      "actual_recon": "N/A",
+      "actual_pivots": "N/A",
+      "validated": false
+    },
+    "timing_median": {
+      "claim": "0.41 hours median recon-to-pivot",
+      "actual": "N/A",
+      "validated": false,
+      "note": "Timing validation skipped to avoid long-running queries"
+    }
+  },
+  "source_files": {
+    "database_exploration": "database_exploration.json",
+    "validation_notebook": "explore.ipynb"
+  }
+}
